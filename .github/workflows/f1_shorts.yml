@@ -1,11 +1,6 @@
 name: F1 Shorts Autonomous Pipeline
 
 on:
-  schedule:
-    # 10:47 AM IST (UTC+5:30)
-    - cron: '17 5 * * *'
-    # 7:12 PM IST (UTC+5:30)
-    - cron: '42 13 * * *'
   workflow_dispatch:
 
 permissions:
