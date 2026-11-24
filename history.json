@@ -1,3 +1,20 @@
 {
-  "uploads": []
+  "uploads": [
+    {
+      "topic_slug": "1978-brabham-bt46b-fan-car",
+      "category": "crazy_f1_history",
+      "title": "The Banned F1 Car With a 100% Win Rate #f1",
+      "video_id": "cPMQbH60dXI",
+      "upload_date": "2026-11-24T05:07:50.580845+00:00",
+      "angle": "Gordon Murray exploited an engine-cooling loophole to build a vacuum-cleaner F1 car that blew rocks at rivals and won its only race."
+    },
+    {
+      "topic_slug": "2020-bahrain-gp-grosjean-67g-survival",
+      "category": "did_you_know_facts",
+      "title": "The 'Ugly' F1 Bar That Saved Grosjean #f1",
+      "video_id": "ivNlsO5px_8",
+      "upload_date": "2026-11-24T05:09:19.212957+00:00",
+      "angle": "The titanium cockpit bar fans once mocked as ugly saved Romain Grosjean's life during a 67G fireball crash he survived for 28 seconds."
+    }
+  ]
 }
