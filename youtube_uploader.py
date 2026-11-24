@@ -224,6 +224,11 @@ def upload_short(
         raise FileNotFoundError(f"Rendered Short not found: {video_path}")
 
     title = str(metadata["title"]).strip()
+    if not title.lower().endswith("#shorts"):
+        base = title.replace("#f1", "").replace("#F1", "").strip(" -:|,")
+        if len(base) > 51:
+            base = base[:51].rsplit(" ", 1)[0].rstrip(" -:|,")
+        title = f"{base} #shorts"
     description = str(metadata["description"]).strip()
     tags = [str(t).strip() for t in metadata.get("tags", []) if str(t).strip()][:15]
 

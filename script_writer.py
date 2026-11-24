@@ -90,7 +90,7 @@ class F1ShortScript(BaseModel):
     """Complete casual-friendly F1 Short script, visual photo plan, thumbnail hook, and metadata."""
 
     title: str = Field(
-        description="Curiosity-driven YouTube Shorts title strictly under 55 characters, naturally including #f1."
+        description="Clickable curiosity-gap YouTube Shorts title strictly under 60 characters, ending with #shorts."
     )
     thumbnail_hook: str = Field(
         description="Bold, punchy 3-4 word high-click thumbnail hook text in ALL CAPS (e.g. 'ONLY 6 CARS!', '$100M PHOTOCOPY', '350 KM/H CHAOS')."
@@ -149,20 +149,17 @@ def find_unexplained_jargon(beats: list[VisualBeat]) -> list[str]:
 
 
 def normalize_title(title: str) -> str:
-    """Ensure title includes #f1 and stays strictly under 55 characters."""
+    """Ensure title is strictly under 60 characters and ends cleanly with #shorts."""
     clean = " ".join(title.strip().split())
-    if "#f1" not in clean.lower():
-        clean = f"{clean} #f1"
-
-    if len(clean) <= MAX_TITLE_LENGTH:
-        return clean
-
-    base = re.sub(r"\s*#f1\b", "", clean, flags=re.IGNORECASE).strip(" -:|,")
-    max_base = MAX_TITLE_LENGTH - 4  # space + "#f1"
-    trimmed = base[:max_base].rsplit(" ", 1)[0].rstrip(" -:|,")
-    if not trimmed:
-        trimmed = base[:max_base].strip()
-    return f"{trimmed} #f1"
+    # Strip any existing trailing/inline #shorts or #f1 so we end cleanly with #shorts
+    base = re.sub(r"\s*#shorts\b", "", clean, flags=re.IGNORECASE).strip(" -:|,")
+    base = re.sub(r"\s*#f1\b", "", base, flags=re.IGNORECASE).strip(" -:|,")
+    suffix = " #shorts"
+    max_base = MAX_TITLE_LENGTH - len(suffix)
+    if len(base) > max_base:
+        trimmed = base[:max_base].rsplit(" ", 1)[0].rstrip(" -:|,")
+        base = trimmed if trimmed else base[:max_base].strip()
+    return f"{base}{suffix}"
 
 
 def normalize_thumbnail_hook(hook: str) -> str:
@@ -229,11 +226,11 @@ def validate_script(script: F1ShortScript) -> list[str]:
             f"Include at least 4 mid-video stat/detail pop-up badges across beats (found {badge_count})."
         )
 
-    # Check title length & #f1 tag
-    if len(script.title.strip()) >= 55:
-        errors.append(f"Title too long ({len(script.title.strip())} chars; must be strictly under 55 chars).")
-    if "#f1" not in script.title.lower():
-        errors.append("Title must naturally include '#f1'.")
+    # Check title length (< 60 chars) & #shorts ending
+    if len(script.title.strip()) >= 60:
+        errors.append(f"Title too long ({len(script.title.strip())} chars; must be strictly under 60 chars).")
+    if not script.title.strip().lower().endswith("#shorts"):
+        errors.append("Title must end with '#shorts'.")
 
     # Check tag count
     clean_tags = [t.strip().lstrip("#") for t in script.tags if t.strip()]
@@ -269,7 +266,7 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
         "4. Break the story into **8 to 10 punchy 1-sentence beats** (each beat = ONE clear, conversational "
         "sentence of ~10-14 words, because TTS runs at a relaxed -10% speed with 0.35s breathing pauses between beats).\n"
         "5. Total spoken words across ALL beats MUST be **105 to 122 words** (strictly inside 95-128 words).\n"
-        "6. Beat 0 (Scroll-Stopper Hook): Start mid-action or with a jaw-dropping stat—never a greeting.\n"
+        "6. Beat 0 (0-2s Curiosity-Gap Hook): Open with an immediate curiosity gap or jaw-dropping contrast in the first 2 seconds—never a greeting.\n"
         "7. REAL F1 PHOTO QUERIES: For EVERY beat, provide a clean Wikimedia Commons search query in `photo_query` "
         "naming the specific driver, team, car, or track (plus a distinct `secondary_photo_query` for fast mid-beat visual cuts). "
         "Examples: 'Max Verstappen Red Bull Formula 1', 'Ferrari F1 pit stop', 'Lewis Hamilton Mercedes Formula 1', "
@@ -281,8 +278,8 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
         "10. HIGH-CLICK THUMBNAIL & METADATA:\n"
         "   - `thumbnail_hook`: Bold 3-4 word ALL CAPS hook (e.g. 'ONLY 6 CARS!', '350 KM/H CHAOS').\n"
         "   - `hero_photo_query`: Most dramatic real F1 photo query for the thumbnail.\n"
-        "   - `title`: Curiosity-driven, STRICTLY under 55 characters, naturally containing `#f1`.\n"
-        "   - `description`: 2 punchy casual sentences + `#f1 #shorts #formula1` + 2-3 topic hashtags.\n"
+        "   - `title`: Clickable curiosity-gap title STRICTLY under 60 characters, ending with `#shorts`.\n"
+        "   - `description`: SEO-rich 2-sentence casual hook summary + `#f1 #shorts #formula1` + 2-3 topic hashtags.\n"
         "   - `tags`: 12-15 high-volume F1 tags.\n"
         "Return ONLY valid JSON matching the schema."
     )
@@ -305,7 +302,7 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
             "- 8 to 10 beats, ONE punchy sentence per beat, 105-122 total spoken words.\n"
             "- Zero unexplained engineering jargon, zero AI clichés.\n"
             "- Every beat has a specific Wikimedia Commons F1 `photo_query`, and at least 5 beats have a punchy `callout_badge`.\n"
-            "- Title strictly under 55 characters with `#f1`, `thumbnail_hook` is 3-4 bold words.\n"
+            "- Title strictly under 60 characters ending with `#shorts`, `thumbnail_hook` is 3-4 bold words.\n"
             "- Final beat loops seamlessly back into Beat 0."
         )
 

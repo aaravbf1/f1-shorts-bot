@@ -96,7 +96,7 @@ MAX_HARD_DURATION_SEC = 58.8
 # Script guardrails (calibrated for -10% TTS rate + 0.35s pauses across 8-10 1-sentence beats -> ~44-54s)
 MIN_WORD_COUNT = 95
 MAX_WORD_COUNT = 128
-MAX_TITLE_LENGTH = 54  # strictly under 55 chars
+MAX_TITLE_LENGTH = 59  # strictly under 60 chars, ending with #shorts
 
 BANNED_JARGON_TERMS = [
     "cfd",

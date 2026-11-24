@@ -381,7 +381,7 @@ async def _build_timed_voiceover(
             "-i",
             str(concat_list),
             "-af",
-            "loudnorm=I=-15:TP=-1.5:LRA=9",
+            "loudnorm=I=-14:TP=-1.2:LRA=8",
             "-ar",
             "44100",
             "-ac",
@@ -1076,8 +1076,8 @@ def build_short_video(
             return np.asarray(frame)
 
         render_t0 = time.monotonic()
-        render_threads = max(2, os.cpu_count() or 4)
-        logger.info("Rendering 1080x1920 30fps H.264 MP4 (%d threads, ultrafast) -> %s", render_threads, output_mp4.name)
+        render_threads = 4
+        logger.info("Rendering 1080x1920 30fps H.264 MP4 (%d threads, veryfast) -> %s", render_threads, output_mp4.name)
         video_clip = VideoClip(make_frame, duration=total_duration)
         audio_clip = AudioFileClip(str(master_audio_path))
         try:
@@ -1088,9 +1088,9 @@ def build_short_video(
                 codec="libx264",
                 audio_codec="aac",
                 audio_bitrate="192k",
-                preset="ultrafast",
+                preset="veryfast",
                 threads=render_threads,
-                ffmpeg_params=["-crf", "22", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+                ffmpeg_params=["-crf", "21", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
                 logger=None,
             )
         finally:

@@ -86,7 +86,7 @@ class F1TopicCandidate(BaseModel):
         description="Short unique kebab-case identifier, e.g. '2005-us-gp-six-cars-only'."
     )
     working_title: str = Field(
-        description="Punchy curiosity-driven working title under 54 characters including #f1."
+        description="Punchy curiosity-gap title strictly under 60 characters ending with #shorts."
     )
     angle: str = Field(
         description="One-sentence dramatic human angle focusing on ego, danger, speed, or controversy."
