@@ -67,3 +67,8 @@ jobs:
               git push origin HEAD:main
             fi
           fi
+
+      - name: Notify on Failure
+        if: failure()
+        run: |
+          curl -s -H "Title: F1 Shorts Upload Failed" -H "Priority: high" -H "Tags: rotating_light" -d "Run #${{ github.run_number }} failed. Check logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}"
