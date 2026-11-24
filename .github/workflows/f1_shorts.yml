@@ -47,6 +47,8 @@ jobs:
           TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
           PRIVACY_STATUS: public
           YOUTUBE_PRIVACY_STATUS: public
+          TTS_RATE: "-10%"
+          INTER_BEAT_GAP_SEC: "0.35"
           ANTIGRAVITY_MODEL: gemini-4-hydrogen
           ANTIGRAVITY_FALLBACK_MODELS: gemini-3.6-flash,gemini-3.5-flash
           LLM_CALL_TIMEOUT_SEC: "75"

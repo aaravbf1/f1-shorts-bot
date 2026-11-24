@@ -17,6 +17,7 @@ ASSETS_DIR = BASE_DIR / "assets"
 BACKGROUNDS_DIR = ASSETS_DIR / "backgrounds"
 FONTS_DIR = ASSETS_DIR / "fonts"
 AUDIO_DIR = ASSETS_DIR / "audio"
+PHOTOS_DIR = ASSETS_DIR / "photos"
 
 HISTORY_FILE = BASE_DIR / "history.json"
 CLIENT_SECRET_FILE = BASE_DIR / "client_secret.json"
@@ -41,9 +42,12 @@ TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "45"))
 FFMPEG_TIMEOUT_SEC = int(os.getenv("FFMPEG_TIMEOUT_SEC", "120"))
 YOUTUBE_HTTP_TIMEOUT_SEC = int(os.getenv("YOUTUBE_HTTP_TIMEOUT_SEC", "60"))
 
-# TTS configuration
+# TTS configuration (slower, clearer storytelling pace with 0.35s beat breathing pauses)
 TTS_VOICE = os.getenv("TTS_VOICE", "en-GB-RyanNeural").strip()
-TTS_RATE = os.getenv("TTS_RATE", "+6%").strip()
+TTS_RATE = os.getenv("TTS_RATE", "-10%").strip()
+INTER_BEAT_GAP_SEC = float(os.getenv("INTER_BEAT_GAP_SEC", "0.35"))
+THUMBNAIL_FLASH_SEC = float(os.getenv("THUMBNAIL_FLASH_SEC", "0.15"))
+PHOTO_SWAP_INTERVAL_SEC = float(os.getenv("PHOTO_SWAP_INTERVAL_SEC", "3.0"))
 AVAILABLE_VOICES = ("en-GB-RyanNeural", "en-US-AndrewNeural")
 
 # YouTube Data API v3 configuration
@@ -81,10 +85,29 @@ TARGET_MIN_DURATION_SEC = 42.0
 TARGET_MAX_DURATION_SEC = 55.0
 MAX_HARD_DURATION_SEC = 58.8
 
-# Script guardrails
-MIN_WORD_COUNT = 110
-MAX_WORD_COUNT = 145
+# Script guardrails (calibrated for -10% TTS rate + 0.35s pauses across 8-10 1-sentence beats -> ~44-54s)
+MIN_WORD_COUNT = 95
+MAX_WORD_COUNT = 128
 MAX_TITLE_LENGTH = 54  # strictly under 55 chars
+
+BANNED_JARGON_TERMS = [
+    "cfd",
+    "venturi tunnel",
+    "venturi tunnels",
+    "bargeboard",
+    "bargeboards",
+    "porpoising",
+    "telemetry",
+    "ground effect vortex",
+    "brake migration",
+    "differential map",
+    "thermal degradation",
+    "aerodynamic efficiency",
+    "aero efficiency",
+    "floor edge vortex",
+    "beam wing",
+    "diffuser stall",
+]
 
 BANNED_AI_PHRASES = [
     "delve",
@@ -108,41 +131,71 @@ BANNED_AI_PHRASES = [
     "needless to say",
 ]
 
-# Category pool for randomized daily selection
+# Anti-repetition threshold (reject and regenerate if topic/title overlaps > 40% with history.json)
+TOPIC_OVERLAP_THRESHOLD = 0.40
+
+# Diverse 7-category F1 Shorts pool for strong randomization so consecutive Shorts never feel similar
 F1_CATEGORIES = [
     {
-        "id": "trending_paddock_drama",
-        "label": "Trending Paddock Drama & News",
+        "id": "wild_f1_rules_loopholes",
+        "label": "Wild F1 Rules & Loopholes",
         "description": (
-            "Latest F1 headlines, driver contract rumors, fiery team radio, "
-            "steward penalties, team boss clashes, or recent race weekend drama."
+            "Clever rulebook loopholes, six-wheeled cars, banned inventions, bizarre penalties, "
+            "or sneaky tricks teams pulled off before the FIA shut them down."
+        ),
+        "requires_live_news": False,
+    },
+    {
+        "id": "pit_stop_strategy_gambles",
+        "label": "Crazy Pit-Stop & Strategy Gambles",
+        "description": (
+            "Sub-2-second pit stop records, disastrous pit-lane blunders, genius tire calls, "
+            "last-lap gambles, or legendary team radio strategy arguments."
+        ),
+        "requires_live_news": False,
+    },
+    {
+        "id": "historic_rivalries_controversies",
+        "label": "Historic Rivalries & Controversies",
+        "description": (
+            "Explosive teammate feuds, title-deciding collisions, mind games, paddock betrayals, "
+            "team-order rebellions, and unforgettable championship showdowns."
+        ),
+        "requires_live_news": False,
+    },
+    {
+        "id": "driver_fitness_gforce_extremes",
+        "label": "Driver Fitness & G-Force Extremes",
+        "description": (
+            "What an F1 driver's body actually endures: 5G braking, neck-snapping corners, "
+            "50C cockpit heat, losing 3-4 kg of sweat in one race, and superhuman reaction times."
+        ),
+        "requires_live_news": False,
+    },
+    {
+        "id": "bizarre_f1_records_crashes",
+        "label": "Bizarre F1 Records & Wild Crashes",
+        "description": (
+            "Unbelievable F1 records, shock underdog wins, freak mechanical moments, "
+            "impossible comebacks from last to first, and jaw-dropping survival stories."
+        ),
+        "requires_live_news": False,
+    },
+    {
+        "id": "current_2026_season_drama",
+        "label": "2026 F1 Season Drama & Headlines",
+        "description": (
+            "Fresh 2026 Formula 1 paddock drama, driver clashes, spicy team radio, "
+            "contract tension, steward penalties, and this week's biggest F1 talking points."
         ),
         "requires_live_news": True,
     },
     {
-        "id": "crazy_f1_history",
-        "label": "Crazy F1 History & Untold Stories",
+        "id": "iconic_tracks_weather_chaos",
+        "label": "Iconic Tracks & Weather Chaos",
         "description": (
-            "Legendary rivalries, infamous crashes, banned technical loopholes, "
-            "shocking underdog wins, and wild paddock scandals."
-        ),
-        "requires_live_news": False,
-    },
-    {
-        "id": "did_you_know_facts",
-        "label": '"Did You Know?" F1 Facts & Rules',
-        "description": (
-            "Surprising facts everyday fans love: extreme G-forces drivers survive, "
-            "steering wheel costs, insane pit stop records, cockpit heat, or weird FIA rules."
-        ),
-        "requires_live_news": False,
-    },
-    {
-        "id": "what_if_goat_debates",
-        "label": 'Bold "What If?" & GOAT Debates',
-        "description": (
-            "Spicy cross-era comparisons, luckiest championship wins, "
-            "biggest team strategy blunders, or career-changing sliding-doors moments."
+            "Chaotic rain-soaked classics, Monaco street-circuit madness, Monza top-speed extremes, "
+            "Spa unpredictability, and races flipped upside down by sudden weather."
         ),
         "requires_live_news": False,
     },
@@ -175,5 +228,6 @@ def ensure_directories() -> None:
         BACKGROUNDS_DIR,
         FONTS_DIR,
         AUDIO_DIR,
+        PHOTOS_DIR,
     ):
         directory.mkdir(parents=True, exist_ok=True)

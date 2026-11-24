@@ -1,4 +1,4 @@
-"""Vertical 9:16 YouTube Shorts video builder using edge-tts, FFmpeg, Pillow, and MoviePy."""
+"""Vertical 9:16 YouTube Shorts video builder with full-bleed real F1 photos, Ken Burns motion, mid-video badges, and custom thumbnails."""
 
 from __future__ import annotations
 
@@ -17,10 +17,17 @@ import edge_tts
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from asset_generator import ensure_all_assets
+from asset_generator import (
+    compose_full_bleed_vertical_photo,
+    ensure_all_assets,
+    fetch_f1_photos_for_script,
+    generate_high_click_thumbnail,
+)
 from config import (
     FFMPEG_TIMEOUT_SEC,
+    INTER_BEAT_GAP_SEC,
     MAX_HARD_DURATION_SEC,
+    PHOTO_SWAP_INTERVAL_SEC,
     SAFE_BOTTOM,
     SAFE_LEFT,
     SAFE_RIGHT,
@@ -28,6 +35,7 @@ from config import (
     SAFE_WIDTH,
     TARGET_MAX_DURATION_SEC,
     TEAM_PALETTES,
+    THUMBNAIL_FLASH_SEC,
     TTS_RATE,
     TTS_TIMEOUT_SEC,
     TTS_VOICE,
@@ -45,7 +53,6 @@ def _find_ffmpeg() -> str:
     if found:
         return found
 
-    # Check common WinGet / Gyan FFmpeg locations on Windows
     local_winget = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
     if local_winget.exists():
         for candidate in local_winget.rglob("ffmpeg.exe"):
@@ -71,7 +78,7 @@ def _find_ffprobe(ffmpeg_bin: str) -> str | None:
 
 
 def get_audio_duration(path: Path, ffmpeg_bin: str) -> float:
-    """Return exact duration in seconds using ffprobe or ffmpeg stderr parsing."""
+    """Return exact duration in seconds using ffprobe or MoviePy fallback."""
     ffprobe = _find_ffprobe(ffmpeg_bin)
     if ffprobe:
         proc = subprocess.run(
@@ -92,7 +99,6 @@ def get_audio_duration(path: Path, ffmpeg_bin: str) -> float:
         )
         return float(proc.stdout.strip())
 
-    # Fallback via MoviePy AudioFileClip
     from moviepy import AudioFileClip
 
     with AudioFileClip(str(path)) as clip:
@@ -110,6 +116,7 @@ class TimedWord:
 class TimedBeat:
     index: int
     card_type: str
+    callout_badge: str
     header: str
     subtext: str
     stat_value: str
@@ -125,6 +132,15 @@ class TimedBeat:
     words: list[TimedWord]
 
 
+@dataclass
+class PhotoShot:
+    start: float
+    end: float
+    image: Image.Image  # Pre-composed oversized full-bleed vertical F1 photo
+    zoom_in: bool
+    pan_dir: int  # -1 left, +1 right, 0 center vertical
+
+
 def _resolve_team_rgb(name: str, default_key: str = "f1_red") -> tuple[int, int, int]:
     key = (name or "").strip().lower().replace(" ", "_").replace("-", "_")
     if key in TEAM_PALETTES:
@@ -133,17 +149,6 @@ def _resolve_team_rgb(name: str, default_key: str = "f1_red") -> tuple[int, int,
         if palette_key in key or key in palette_key:
             return rgb
     return TEAM_PALETTES[default_key]
-
-
-def _resolve_bg_key(team_color_name: str) -> str:
-    key = (team_color_name or "").strip().lower().replace(" ", "_").replace("-", "_")
-    valid = {"f1_red", "ferrari", "red_bull", "mercedes", "mclaren", "aston_martin", "gold"}
-    if key in valid:
-        return key
-    for v in valid:
-        if v in key:
-            return v
-    return "f1_red"
 
 
 async def _synthesize_beat_tts(
@@ -186,11 +191,11 @@ async def _synthesize_beat_tts(
 
 
 def _trim_silence_ffmpeg(raw_audio: Path, trimmed_wav: Path, ffmpeg_bin: str) -> None:
-    """Strip dead air using FFmpeg silenceremove while keeping speech crisp and natural."""
+    """Strip leading/trailing dead air while preserving natural slower narration clarity."""
     filter_expr = (
         "silenceremove="
-        "start_periods=1:start_duration=0.015:start_threshold=-42dB:"
-        "stop_periods=-1:stop_duration=0.26:stop_threshold=-42dB"
+        "start_periods=1:start_duration=0.02:start_threshold=-44dB:"
+        "stop_periods=-1:stop_duration=0.30:stop_threshold=-44dB"
     )
     cmd = [
         ffmpeg_bin,
@@ -229,7 +234,6 @@ def _align_words_to_trimmed_duration(
             aligned.append(TimedWord(word=w.word, start=s, end=e))
         return aligned
 
-    # Character-weighted fallback if WordBoundary events were unavailable
     tokens = [tok for tok in text.split() if tok.strip()]
     if not tokens:
         return []
@@ -251,7 +255,7 @@ async def _build_timed_voiceover(
     voice: str = TTS_VOICE,
     rate: str = TTS_RATE,
 ) -> tuple[Path, list[TimedBeat], list[TimedWord], float]:
-    """Synthesize beat-by-beat narration, trim dead gaps, concatenate, and enforce <60s."""
+    """Synthesize beat-by-beat narration (-10% pace, 0.35s breathing pauses, 0.15s thumbnail flash)."""
     beats_raw = script_data.get("beats", [])
     if not beats_raw:
         raise ValueError("Script has no visual beats to render.")
@@ -261,8 +265,9 @@ async def _build_timed_voiceover(
 
     timed_beats: list[TimedBeat] = []
     beat_wavs: list[Path] = []
-    cursor = 0.0
-    inter_beat_gap = 0.12  # crisp natural breath between visual beats (keeps 130-145 words in 42-55s)
+    lead_in_sec = THUMBNAIL_FLASH_SEC  # 0.15s dedicated thumbnail hook frame at t=0
+    inter_beat_gap = INTER_BEAT_GAP_SEC  # 0.35s breathing pause between 1-sentence beats
+    cursor = lead_in_sec
 
     for idx, beat in enumerate(beats_raw):
         spoken = str(beat.get("spoken_text", "")).strip()
@@ -276,7 +281,6 @@ async def _build_timed_voiceover(
         _trim_silence_ffmpeg(raw_mp3, trimmed_wav, ffmpeg_bin)
         dur = get_audio_duration(trimmed_wav, ffmpeg_bin)
 
-        # Fallback if silenceremove stripped an ultra-short clip too aggressively
         if dur < 0.25:
             subprocess.run(
                 [ffmpeg_bin, "-y", "-i", str(raw_mp3), "-ar", "44100", "-ac", "1", str(trimmed_wav)],
@@ -292,11 +296,16 @@ async def _build_timed_voiceover(
             for w in local_words
         ]
 
-        accent = _resolve_team_rgb(beat.get("accent_color", ""), "f1_red") if beat.get("accent_color") else primary_rgb
+        accent = (
+            _resolve_team_rgb(beat.get("accent_color", ""), "f1_red")
+            if beat.get("accent_color")
+            else primary_rgb
+        )
         timed_beats.append(
             TimedBeat(
                 index=idx,
                 card_type=str(beat.get("card_type", "story_card")).strip().lower(),
+                callout_badge=str(beat.get("callout_badge", "")).strip(),
                 header=str(beat.get("card_header", "")).strip(),
                 subtext=str(beat.get("card_subtext", "")).strip(),
                 stat_value=str(beat.get("stat_value", "")).strip(),
@@ -315,8 +324,8 @@ async def _build_timed_voiceover(
         beat_wavs.append(trimmed_wav)
         cursor += dur + inter_beat_gap
 
-    # Build tiny silence separator WAV and concatenate all beats cleanly
-    gap_wav = work_dir / "micro_gap.wav"
+    # Build lead-in silence (0.15s thumbnail flash) + 0.35s breathing pause separator WAVs
+    lead_wav = work_dir / "lead_thumb.wav"
     subprocess.run(
         [
             ffmpeg_bin,
@@ -324,7 +333,23 @@ async def _build_timed_voiceover(
             "-f",
             "lavfi",
             "-i",
-            f"anullsrc=r=44100:cl=mono:d={inter_beat_gap}",
+            f"anullsrc=r=44100:cl=mono:d={lead_in_sec:.3f}",
+            str(lead_wav),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=FFMPEG_TIMEOUT_SEC,
+    )
+
+    gap_wav = work_dir / "breath_gap.wav"
+    subprocess.run(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=r=44100:cl=mono:d={inter_beat_gap:.3f}",
             str(gap_wav),
         ],
         capture_output=True,
@@ -333,7 +358,7 @@ async def _build_timed_voiceover(
     )
 
     concat_list = work_dir / "concat.txt"
-    lines: list[str] = []
+    lines: list[str] = [f"file '{str(lead_wav).replace(chr(92), '/')}'"]
     for i, wav_path in enumerate(beat_wavs):
         safe_p = str(wav_path).replace("\\", "/")
         lines.append(f"file '{safe_p}'")
@@ -368,13 +393,14 @@ async def _build_timed_voiceover(
 
     total_duration = get_audio_duration(voice_wav, ffmpeg_bin)
 
-    # Strict < 60s enforcement (target 42-55s, hard cap MAX_HARD_DURATION_SEC = 58.8s)
-    if total_duration > TARGET_MAX_DURATION_SEC + 1.5:
-        target_dur = min(TARGET_MAX_DURATION_SEC, MAX_HARD_DURATION_SEC - 0.8)
-        tempo = min(1.22, total_duration / target_dur)
+    # Strict < 60s enforcement (keeps every Short strictly inside YouTube Shorts feed limits)
+    if total_duration > MAX_HARD_DURATION_SEC:
+        target_dur = min(TARGET_MAX_DURATION_SEC + 2.0, MAX_HARD_DURATION_SEC - 0.8)
+        tempo = min(1.18, total_duration / target_dur)
         logger.warning(
-            "Voiceover %.2fs exceeds target; applying FFmpeg atempo=%.3f to lock under 60s.",
+            "Voiceover %.2fs exceeds %.1fs limit; applying subtle FFmpeg atempo=%.3f.",
             total_duration,
+            MAX_HARD_DURATION_SEC,
             tempo,
         )
         sped_wav = work_dir / "voiceover_sped.wav"
@@ -418,11 +444,12 @@ def _mix_master_audio(
     whoosh_path: Path,
     pop_path: Path,
     timed_beats: list[TimedBeat],
+    photo_shots: list[PhotoShot],
     total_duration: float,
     output_audio: Path,
     ffmpeg_bin: str,
 ) -> Path:
-    """Mix normalized voiceover, -22 dB background music bed, and beat transition SFX."""
+    """Mix normalized narration, -22 dB BGM bed, and crisp pop/whoosh SFX on badge & photo transitions."""
     inputs = ["-i", str(voice_wav), "-stream_loop", "-1", "-i", str(bgm_path)]
     filter_parts = [
         "[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=1.0[vo]",
@@ -434,15 +461,17 @@ def _mix_master_audio(
     mix_labels = ["[vo]", "[bgm]"]
     input_idx = 2
 
-    # Overlay crisp whoosh/pop SFX on each visual card transition (skip beat 0 start to keep hook instant)
+    # Crisp pop SFX on every beat with a mid-video callout badge; soft whoosh on other transitions
     for beat in timed_beats[1:]:
-        sfx_file = pop_path if beat.card_type in {"big_stat", "driver_vs_driver"} else whoosh_path
+        has_badge = bool(beat.callout_badge or beat.stat_value or beat.card_type in {"big_stat", "driver_vs_driver"})
+        sfx_file = pop_path if has_badge else whoosh_path
+        vol = "-13dB" if has_badge else "-16dB"
         inputs.extend(["-i", str(sfx_file)])
-        delay_ms = max(0, int((beat.start - 0.04) * 1000))
+        delay_ms = max(0, int((beat.start - 0.08) * 1000))
         label = f"sfx{input_idx}"
         filter_parts.append(
             f"[{input_idx}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
-            f"volume=-14dB,adelay={delay_ms}|{delay_ms}[{label}]"
+            f"volume={vol},adelay={delay_ms}|{delay_ms}[{label}]"
         )
         mix_labels.append(f"[{label}]")
         input_idx += 1
@@ -484,7 +513,7 @@ def _wrap_text(
     text: str,
     font: ImageFont.ImageFont,
     max_width: int,
-    max_lines: int = 4,
+    max_lines: int = 3,
 ) -> list[str]:
     words = text.split()
     if not words:
@@ -502,247 +531,211 @@ def _wrap_text(
             if len(lines) >= max_lines - 1:
                 break
     lines.append(current)
-    # Append remaining words cleanly if truncated
     used = sum(len(line.split()) for line in lines)
     if used < len(words) and len(lines) == max_lines:
         lines[-1] = lines[-1].rstrip(".,!?") + "..."
     return lines
 
 
-def _render_beat_overlay(
+def _build_cinema_scrim() -> Image.Image:
+    """Create a subtle top + lower-third dark cinema gradient so full-bleed F1 photos stay vibrant while text pops."""
+    scrim = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(scrim, "RGBA")
+
+    # Gentle top gradient for header + pop-up badge readability (y=0..460)
+    for y in range(0, 460, 4):
+        alpha = int(170 * (1.0 - y / 460.0) ** 1.4)
+        draw.rectangle([0, y, VIDEO_WIDTH, y + 4], fill=(6, 8, 14, alpha))
+
+    # Smooth lower gradient for crystal-clear captions & comment pill (y=1020..1920)
+    for y in range(1020, VIDEO_HEIGHT, 4):
+        t = (y - 1020) / (VIDEO_HEIGHT - 1020)
+        alpha = int(205 * (t ** 1.15))
+        draw.rectangle([0, y, VIDEO_WIDTH, y + 4], fill=(6, 8, 14, alpha))
+
+    return scrim
+
+
+def _render_beat_hud_overlay(
     beat: TimedBeat,
     category_label: str,
     comment_prompt: str,
     is_final_beat: bool,
     fonts: dict[str, Path],
 ) -> Image.Image:
-    """Render a transparent 1080x1920 RGBA visual beat card respecting Shorts UI safe zones."""
+    """Render sleek upper-zone mid-video pop-up detail badges & HUD while leaving center F1 photography wide open."""
     canvas = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas, "RGBA")
 
-    f_badge = _load_font(fonts["bold"], 28)
-    f_card_title = _load_font(fonts["bold"], 52)
-    f_card_sub = _load_font(fonts["regular"], 34)
-    f_stat_huge = _load_font(fonts["display"], 165)
-    f_vs_big = _load_font(fonts["display"], 88)
-    f_vs_name = _load_font(fonts["bold"], 40)
-    f_quote = _load_font(fonts["bold"], 44)
+    f_badge = _load_font(fonts["bold"], 26)
+    f_callout_big = _load_font(fonts["display"], 86)
+    f_callout_sub = _load_font(fonts["bold"], 30)
+    f_quote = _load_font(fonts["bold"], 34)
+    f_vs_name = _load_font(fonts["bold"], 32)
     f_prompt = _load_font(fonts["bold"], 31)
 
     ar, ag, ab = beat.accent_rgb
     sr, sg, sb = beat.secondary_rgb
 
-    # Top category badge inside safe zone (y=196..256)
-    badge_text = f"F1  |  {category_label.upper()}"
-    if len(badge_text) > 38:
-        badge_text = badge_text[:35].rstrip() + "..."
-    tb = draw.textbbox((0, 0), badge_text, font=f_badge)
-    badge_w = min(SAFE_WIDTH, (tb[2] - tb[0]) + 52)
+    # Top compact category tag inside safe zone (y=194..246)
+    cat_txt = f"F1  |  {category_label.upper()}"
+    if len(cat_txt) > 34:
+        cat_txt = cat_txt[:31].rstrip() + "..."
+    tb = draw.textbbox((0, 0), cat_txt, font=f_badge)
+    cat_w = min(SAFE_WIDTH, (tb[2] - tb[0]) + 46)
     draw.rounded_rectangle(
-        [SAFE_LEFT, SAFE_TOP + 10, SAFE_LEFT + badge_w, SAFE_TOP + 66],
-        radius=16,
-        fill=(18, 20, 28, 225),
-        outline=(ar, ag, ab, 230),
+        [SAFE_LEFT, SAFE_TOP + 8, SAFE_LEFT + cat_w, SAFE_TOP + 58],
+        radius=14,
+        fill=(12, 14, 20, 205),
+        outline=(ar, ag, ab, 235),
         width=3,
     )
-    draw.rectangle([SAFE_LEFT + 14, SAFE_TOP + 24, SAFE_LEFT + 22, SAFE_TOP + 52], fill=(ar, ag, ab, 255))
-    draw.text((SAFE_LEFT + 34, SAFE_TOP + 21), badge_text, font=f_badge, fill=(242, 245, 250, 255))
+    draw.rectangle([SAFE_LEFT + 12, SAFE_TOP + 20, SAFE_LEFT + 19, SAFE_TOP + 46], fill=(ar, ag, ab, 255))
+    draw.text((SAFE_LEFT + 30, SAFE_TOP + 18), cat_txt, font=f_badge, fill=(246, 248, 252, 255))
 
-    # Main visual card container strictly inside safe zone:
-    # x: SAFE_LEFT (56) .. SAFE_RIGHT (896) -> completely clear of right-side YT icons
-    # y: 292 .. 852 -> completely clear of top bar and bottom subtitles/description
-    card_x0, card_y0, card_x1, card_y1 = SAFE_LEFT, 292, SAFE_RIGHT, 845
-    card_w = card_x1 - card_x0
+    # Mid-video attention pop-up detail badge in upper safe zone (y=268..435)
+    # Deliberately compact so the middle of the 1080x1920 real F1 photo stays 100% visible!
+    badge_headline = (beat.callout_badge or beat.stat_value or "").strip().upper()
+    badge_sub = (beat.stat_label or beat.header or "").strip().upper()
 
-    # Soft drop shadow
-    draw.rounded_rectangle(
-        [card_x0 + 8, card_y0 + 12, card_x1 + 8, card_y1 + 12],
-        radius=30,
-        fill=(0, 0, 0, 120),
-    )
-    # Glass dark card base
-    draw.rounded_rectangle(
-        [card_x0, card_y0, card_x1, card_y1],
-        radius=30,
-        fill=(16, 19, 27, 232),
-        outline=(255, 255, 255, 42),
-        width=2,
-    )
-    # Bold team accent top bar
-    draw.rounded_rectangle(
-        [card_x0 + 24, card_y0 + 18, card_x1 - 24, card_y0 + 30],
-        radius=6,
-        fill=(ar, ag, ab, 255),
-    )
-
-    inner_x = card_x0 + 42
-    inner_w = card_w - 84
-
-    if beat.card_type == "big_stat":
-        stat_val = (beat.stat_value or beat.header or "F1").upper()
-        stat_lbl = (beat.stat_label or beat.subtext or beat.header).upper()
-
-        # Fit giant stat cleanly inside card width
-        stat_font_size = 165
-        while stat_font_size > 82:
-            f_stat_huge = _load_font(fonts["display"], stat_font_size)
-            sbbox = draw.textbbox((0, 0), stat_val, font=f_stat_huge)
-            if (sbbox[2] - sbbox[0]) <= inner_w:
-                break
-            stat_font_size -= 10
-
-        sbbox = draw.textbbox((0, 0), stat_val, font=f_stat_huge)
-        sw = sbbox[2] - sbbox[0]
-        sh = sbbox[3] - sbbox[1]
-        sx = card_x0 + (card_w - sw) // 2
-        sy = card_y0 + 115
-
-        draw.text((sx + 5, sy + 6), stat_val, font=f_stat_huge, fill=(0, 0, 0, 190))
-        draw.text((sx, sy), stat_val, font=f_stat_huge, fill=(ar, ag, ab, 255))
-
-        # Divider bar
-        div_y = sy + sh + 42
-        draw.rectangle([card_x0 + 160, div_y, card_x1 - 160, div_y + 5], fill=(255, 255, 255, 70))
-
-        lbl_lines = _wrap_text(draw, stat_lbl, f_card_title, inner_w, max_lines=2)
-        ly = div_y + 34
-        for line in lbl_lines:
-            lb = draw.textbbox((0, 0), line, font=f_card_title)
-            lx = card_x0 + (card_w - (lb[2] - lb[0])) // 2
-            draw.text((lx, ly), line, font=f_card_title, fill=(246, 248, 252, 255))
-            ly += 62
-
-    elif beat.card_type == "quote_callout":
-        speaker = (beat.quote_speaker or "TEAM RADIO").upper()
-        quote_body = beat.header or beat.subtext or "BOX THIS LAP!"
-        if not quote_body.startswith('"'):
-            quote_body = f'"{quote_body}"'
-
-        # Radio pill header dynamically sized to speaker label
-        radio_label = f"RADIO  •  {speaker[:20]}"
-        rb = draw.textbbox((0, 0), radio_label, font=f_badge)
-        radio_pill_w = min(inner_w - 175, (rb[2] - rb[0]) + 40)
+    if beat.card_type == "driver_vs_driver" and beat.left_label and beat.right_label:
+        box_y0, box_y1 = 270, 398
+        mid_x = SAFE_LEFT + SAFE_WIDTH // 2
         draw.rounded_rectangle(
-            [inner_x, card_y0 + 58, inner_x + radio_pill_w, card_y0 + 108],
-            radius=12,
-            fill=(ar, ag, ab, 235),
-        )
-        draw.text((inner_x + 18, card_y0 + 67), radio_label, font=f_badge, fill=(255, 255, 255, 255))
-
-        # Decorative telemetry waveform bars
-        bar_y = card_y0 + 83
-        for bi, bh in enumerate([10, 22, 34, 18, 28, 14, 30, 20, 12]):
-            bx = card_x1 - 46 - bi * 16
-            draw.rectangle([bx - 4, bar_y - bh // 2, bx + 4, bar_y + bh // 2], fill=(ar, ag, ab, 210))
-
-        q_lines = _wrap_text(draw, quote_body, f_quote, inner_w, max_lines=5)
-        qy = card_y0 + 150
-        for line in q_lines:
-            draw.text((inner_x, qy), line, font=f_quote, fill=(250, 250, 255, 255))
-            qy += 58
-
-        if beat.subtext and beat.subtext != beat.header:
-            s_lines = _wrap_text(draw, beat.subtext, f_card_sub, inner_w, max_lines=2)
-            sy = max(qy + 22, card_y1 - 115)
-            for line in s_lines:
-                draw.text((inner_x, sy), line, font=f_card_sub, fill=(195, 205, 220, 240))
-                sy += 42
-
-    elif beat.card_type == "driver_vs_driver":
-        left_txt = (beat.left_label or "DRIVER A").upper()
-        right_txt = (beat.right_label or "DRIVER B").upper()
-        header_txt = (beat.header or "HEAD TO HEAD").upper()
-
-        hb = draw.textbbox((0, 0), header_txt, font=f_badge)
-        hx = card_x0 + (card_w - (hb[2] - hb[0])) // 2
-        draw.text((hx, card_y0 + 54), header_txt, font=f_badge, fill=(210, 218, 230, 240))
-
-        box_y0 = card_y0 + 115
-        box_y1 = card_y1 - 125
-        mid_x = card_x0 + card_w // 2
-        gap = 26
-
-        # Left side card
-        draw.rounded_rectangle(
-            [inner_x, box_y0, mid_x - gap, box_y1],
-            radius=22,
-            fill=(26, 30, 42, 240),
+            [SAFE_LEFT, box_y0, mid_x - 28, box_y1],
+            radius=20,
+            fill=(14, 17, 25, 222),
             outline=(ar, ag, ab, 245),
             width=4,
         )
-        draw.rectangle([inner_x + 16, box_y0 + 16, mid_x - gap - 16, box_y0 + 26], fill=(ar, ag, ab, 255))
-        l_lines = _wrap_text(draw, left_txt, f_vs_name, (mid_x - gap - inner_x) - 32, max_lines=3)
-        ly = box_y0 + 68
-        for line in l_lines:
-            lb = draw.textbbox((0, 0), line, font=f_vs_name)
-            lx = inner_x + ((mid_x - gap - inner_x) - (lb[2] - lb[0])) // 2
-            draw.text((lx, ly), line, font=f_vs_name, fill=(255, 255, 255, 255))
-            ly += 50
-
-        # Right side card
         draw.rounded_rectangle(
-            [mid_x + gap, box_y0, card_x1 - 42, box_y1],
-            radius=22,
-            fill=(26, 30, 42, 240),
+            [mid_x + 28, box_y0, SAFE_RIGHT, box_y1],
+            radius=20,
+            fill=(14, 17, 25, 222),
             outline=(sr, sg, sb, 245),
             width=4,
         )
-        draw.rectangle([mid_x + gap + 16, box_y0 + 16, card_x1 - 58, box_y0 + 26], fill=(sr, sg, sb, 255))
-        r_lines = _wrap_text(draw, right_txt, f_vs_name, (card_x1 - 42 - (mid_x + gap)) - 32, max_lines=3)
-        ry = box_y0 + 68
-        for line in r_lines:
-            rb = draw.textbbox((0, 0), line, font=f_vs_name)
-            rx = (mid_x + gap) + ((card_x1 - 42 - (mid_x + gap)) - (rb[2] - rb[0])) // 2
-            draw.text((rx, ry), line, font=f_vs_name, fill=(255, 255, 255, 255))
-            ry += 50
+        l_lines = _wrap_text(draw, beat.left_label.upper(), f_vs_name, (mid_x - 28 - SAFE_LEFT) - 24, max_lines=2)
+        ly = box_y0 + (box_y1 - box_y0 - len(l_lines) * 40) // 2
+        for ln in l_lines:
+            lb = draw.textbbox((0, 0), ln, font=f_vs_name)
+            lx = SAFE_LEFT + ((mid_x - 28 - SAFE_LEFT) - (lb[2] - lb[0])) // 2
+            draw.text((lx, ly), ln, font=f_vs_name, fill=(255, 255, 255, 255))
+            ly += 40
 
-        # Center VS badge
-        vs_r = 46
+        r_lines = _wrap_text(draw, beat.right_label.upper(), f_vs_name, (SAFE_RIGHT - (mid_x + 28)) - 24, max_lines=2)
+        ry = box_y0 + (box_y1 - box_y0 - len(r_lines) * 40) // 2
+        for ln in r_lines:
+            rb = draw.textbbox((0, 0), ln, font=f_vs_name)
+            rx = (mid_x + 28) + ((SAFE_RIGHT - (mid_x + 28)) - (rb[2] - rb[0])) // 2
+            draw.text((rx, ry), ln, font=f_vs_name, fill=(255, 255, 255, 255))
+            ry += 40
+
+        # VS circle
         vs_cy = (box_y0 + box_y1) // 2
-        draw.ellipse([mid_x - vs_r, vs_cy - vs_r, mid_x + vs_r, vs_cy + vs_r], fill=(ar, ag, ab, 255), outline=(255, 255, 255, 255), width=4)
-        vb = draw.textbbox((0, 0), "VS", font=f_vs_big)
-        f_vs_small = _load_font(fonts["display"], 58)
-        vb = draw.textbbox((0, 0), "VS", font=f_vs_small)
-        draw.text((mid_x - (vb[2] - vb[0]) // 2, vs_cy - (vb[3] - vb[1]) // 2 - 4), "VS", font=f_vs_small, fill=(255, 255, 255, 255))
+        draw.ellipse([mid_x - 36, vs_cy - 36, mid_x + 36, vs_cy + 36], fill=(ar, ag, ab, 255), outline=(255, 255, 255, 255), width=3)
+        f_vs_s = _load_font(fonts["display"], 46)
+        vb = draw.textbbox((0, 0), "VS", font=f_vs_s)
+        draw.text((mid_x - (vb[2] - vb[0]) // 2, vs_cy - (vb[3] - vb[1]) // 2 - 4), "VS", font=f_vs_s, fill=(255, 255, 255, 255))
 
-        if beat.subtext:
-            s_lines = _wrap_text(draw, beat.subtext, f_card_sub, inner_w, max_lines=2)
-            sy = box_y1 + 26
-            for line in s_lines:
-                sb2 = draw.textbbox((0, 0), line, font=f_card_sub)
-                sx = card_x0 + (card_w - (sb2[2] - sb2[0])) // 2
-                draw.text((sx, sy), line, font=f_card_sub, fill=(220, 226, 236, 245))
-                sy += 40
+    elif beat.card_type == "quote_callout" and beat.header:
+        box_y0, box_y1 = 270, 442
+        draw.rounded_rectangle(
+            [SAFE_LEFT, box_y0, SAFE_RIGHT, box_y1],
+            radius=22,
+            fill=(12, 15, 23, 222),
+            outline=(ar, ag, ab, 240),
+            width=4,
+        )
+        speaker = (beat.quote_speaker or "TEAM RADIO").upper()[:20]
+        radio_lbl = f"RADIO  •  {speaker}"
+        rb = draw.textbbox((0, 0), radio_lbl, font=f_badge)
+        r_pw = min(SAFE_WIDTH - 190, (rb[2] - rb[0]) + 34)
+        draw.rounded_rectangle([SAFE_LEFT + 22, box_y0 + 18, SAFE_LEFT + 22 + r_pw, box_y0 + 60], radius=10, fill=(ar, ag, ab, 240))
+        draw.text((SAFE_LEFT + 38, box_y0 + 25), radio_lbl, font=f_badge, fill=(255, 255, 255, 255))
+        for bi, bh in enumerate([10, 20, 30, 16, 26, 14, 24]):
+            bx = SAFE_RIGHT - 32 - bi * 14
+            draw.rectangle([bx - 3, box_y0 + 39 - bh // 2, bx + 3, box_y0 + 39 + bh // 2], fill=(ar, ag, ab, 220))
 
-    else:
-        # Default: bold story_card
-        title_txt = (beat.header or "FORMULA 1").upper()
-        t_lines = _wrap_text(draw, title_txt, f_card_title, inner_w, max_lines=3)
-        ty = card_y0 + 78
-        for line in t_lines:
-            draw.text((inner_x, ty), line, font=f_card_title, fill=(255, 255, 255, 255))
-            ty += 66
+        q_txt = beat.header if beat.header.startswith('"') else f'"{beat.header}"'
+        q_lines = _wrap_text(draw, q_txt, f_quote, SAFE_WIDTH - 48, max_lines=2)
+        qy = box_y0 + 74
+        for ln in q_lines:
+            draw.text((SAFE_LEFT + 24, qy), ln, font=f_quote, fill=(255, 255, 255, 255))
+            qy += 42
 
-        # Team accent underline
-        draw.rectangle([inner_x, ty + 14, inner_x + 140, ty + 22], fill=(ar, ag, ab, 255))
+    elif badge_headline:
+        # Bold high-energy mid-video stat / detail pop-up badge (e.g. "350+ KM/H", "5G BRAKING", "1.8s PIT STOP")
+        # Fit headline cleanly
+        h_size = 86
+        while h_size > 48:
+            f_callout_big = _load_font(fonts["display"], h_size)
+            hb = draw.textbbox((0, 0), badge_headline, font=f_callout_big)
+            if (hb[2] - hb[0]) <= SAFE_WIDTH - 90:
+                break
+            h_size -= 6
 
-        if beat.subtext:
-            s_lines = _wrap_text(draw, beat.subtext, f_card_sub, inner_w, max_lines=4)
-            sy = ty + 48
-            for line in s_lines:
-                draw.text((inner_x, sy), line, font=f_card_sub, fill=(210, 218, 232, 245))
-                sy += 46
+        hb = draw.textbbox((0, 0), badge_headline, font=f_callout_big)
+        hw = hb[2] - hb[0]
+        hh = hb[3] - hb[1]
 
-    # On the final beat, display the comment-bait debate prompt safely above bottom 20% zone
+        sub_clean = badge_sub if (badge_sub and badge_sub != badge_headline) else ""
+        if len(sub_clean) > 36:
+            sub_clean = sub_clean[:33].rstrip() + "..."
+        sw = 0
+        if sub_clean:
+            sb_box = draw.textbbox((0, 0), sub_clean, font=f_callout_sub)
+            sw = sb_box[2] - sb_box[0]
+
+        pill_w = min(SAFE_WIDTH, max(hw, sw) + 84)
+        pill_h = hh + (58 if sub_clean else 36)
+        px0 = SAFE_LEFT
+        py0 = 272
+
+        # Glow + dark glass badge with bold neon accent bar
+        draw.rounded_rectangle(
+            [px0 + 6, py0 + 8, px0 + pill_w + 6, py0 + pill_h + 8],
+            radius=22,
+            fill=(0, 0, 0, 145),
+        )
+        draw.rounded_rectangle(
+            [px0, py0, px0 + pill_w, py0 + pill_h],
+            radius=22,
+            fill=(14, 17, 26, 232),
+            outline=(ar, ag, ab, 250),
+            width=4,
+        )
+        draw.rounded_rectangle(
+            [px0 + 14, py0 + 16, px0 + 26, py0 + pill_h - 16],
+            radius=6,
+            fill=(ar, ag, ab, 255),
+        )
+        draw.text(
+            (px0 + 44, py0 + 14),
+            badge_headline,
+            font=f_callout_big,
+            fill=(255, 218, 45, 255),
+            stroke_width=3,
+            stroke_fill=(0, 0, 0, 255),
+        )
+        if sub_clean:
+            draw.text(
+                (px0 + 44, py0 + hh + 24),
+                sub_clean,
+                font=f_callout_sub,
+                fill=(242, 246, 252, 255),
+            )
+
+    # Final beat comment-bait prompt pill safely above YouTube bottom 20% UI zone (y=1375..1485)
     if is_final_beat and comment_prompt:
-        pill_y0 = 1365
-        pill_y1 = SAFE_BOTTOM - 22  # 1488, safely above 1536 (bottom 20%)
+        pill_y0 = 1375
+        pill_y1 = SAFE_BOTTOM - 22  # 1488 < 1536
         draw.rounded_rectangle(
             [SAFE_LEFT, pill_y0, SAFE_RIGHT, pill_y1],
             radius=20,
-            fill=(ar, ag, ab, 235),
-            outline=(255, 255, 255, 210),
-            width=2,
+            fill=(ar, ag, ab, 238),
+            outline=(255, 255, 255, 225),
+            width=3,
         )
         p_lines = _wrap_text(draw, comment_prompt, f_prompt, SAFE_WIDTH - 48, max_lines=2)
         py = pill_y0 + (pill_y1 - pill_y0 - len(p_lines) * 38) // 2
@@ -756,7 +749,7 @@ def _render_beat_overlay(
 
 
 def _build_subtitle_chunks(words: list[TimedWord], chunk_size: int = 3) -> list[list[TimedWord]]:
-    """Group timed words into punchy 3-word mobile subtitle windows."""
+    """Group timed words into crisp 3-word mobile subtitle windows."""
     chunks: list[list[TimedWord]] = []
     cur: list[TimedWord] = []
     for w in words:
@@ -777,34 +770,33 @@ def _draw_active_subtitle(
     accent_rgb: tuple[int, int, int],
     subtitle_font: ImageFont.ImageFont,
 ) -> None:
-    """Draw large center-screen word-by-word highlighted subtitles inside Shorts safe zones."""
+    """Draw crisp, high-contrast captions with highlighted active keyword inside Shorts safe zones."""
     draw = ImageDraw.Draw(frame_img, "RGBA")
     words_upper = [w.word.upper() for w in chunk]
     space_w = 22
 
-    # Measure each word and wrap into 1 or 2 lines inside SAFE_WIDTH
     lines: list[list[tuple[int, str, int, int]]] = [[]]
     line_w = 0
     for idx, word_str in enumerate(words_upper):
-        wb = draw.textbbox((0, 0), word_str, font=subtitle_font, stroke_width=5)
+        wb = draw.textbbox((0, 0), word_str, font=subtitle_font, stroke_width=6)
         ww = wb[2] - wb[0]
         wh = wb[3] - wb[1]
-        if lines[-1] and (line_w + space_w + ww) > (SAFE_WIDTH - 40):
+        if lines[-1] and (line_w + space_w + ww) > (SAFE_WIDTH - 36):
             lines.append([])
             line_w = 0
         lines[-1].append((idx, word_str, ww, wh))
         line_w += (space_w if len(lines[-1]) > 1 else 0) + ww
 
-    # Subtitle band centered between card bottom (845) and comment pill (1365) -> y ~ 1045
-    line_h = 88
+    # Positioned cleanly in lower-center safe zone (y~1215), keeping center F1 photo wide open
+    line_h = 86
     total_h = len(lines) * line_h
-    start_y = 1095 - total_h // 2
+    start_y = 1225 - total_h // 2
 
-    # Subtle dark backing strip behind active caption for razor-sharp mobile readability
+    # Compact translucent backing pill for razor-sharp readability over any photo
     draw.rounded_rectangle(
-        [SAFE_LEFT + 12, start_y - 26, SAFE_RIGHT - 12, start_y + total_h + 26],
+        [SAFE_LEFT + 8, start_y - 22, SAFE_RIGHT - 8, start_y + total_h + 22],
         radius=24,
-        fill=(8, 10, 16, 165),
+        fill=(8, 10, 16, 178),
     )
 
     ar, ag, ab = accent_rgb
@@ -815,26 +807,95 @@ def _draw_active_subtitle(
         for idx, word_str, ww, wh in line_items:
             is_active = idx == active_word_idx
             if is_active:
-                # Use exact rendered textbbox so highlight pill centers vertically on uppercase glyphs
-                wb_exact = draw.textbbox((x, y), word_str, font=subtitle_font, stroke_width=5)
+                wb_exact = draw.textbbox((x, y), word_str, font=subtitle_font, stroke_width=6)
                 draw.rounded_rectangle(
                     [wb_exact[0] - 14, wb_exact[1] - 10, wb_exact[2] + 14, wb_exact[3] + 10],
                     radius=16,
-                    fill=(ar, ag, ab, 245),
+                    fill=(ar, ag, ab, 248),
                 )
                 text_fill = (255, 255, 255, 255)
             else:
-                text_fill = (240, 244, 250, 255)
+                text_fill = (246, 248, 252, 255)
 
             draw.text(
                 (x, y),
                 word_str,
                 font=subtitle_font,
                 fill=text_fill,
-                stroke_width=5,
+                stroke_width=6,
                 stroke_fill=(0, 0, 0, 255),
             )
             x += ww + space_w
+
+
+def _build_photo_shots(
+    timed_beats: list[TimedBeat],
+    beat_photo_paths: list[list[Path]],
+    total_duration: float,
+) -> list[PhotoShot]:
+    """Build a timeline of oversized full-bleed real F1 photos swapping every ~2.5-3.5s with Ken Burns motion."""
+    oversize_w = int(VIDEO_WIDTH * 1.12)
+    oversize_h = int(VIDEO_HEIGHT * 1.12)
+    shots: list[PhotoShot] = []
+    shot_idx = 0
+
+    for i, beat in enumerate(timed_beats):
+        seg_start = beat.start if i > 0 else THUMBNAIL_FLASH_SEC
+        seg_end = timed_beats[i + 1].start if i + 1 < len(timed_beats) else total_duration
+        seg_dur = max(0.5, seg_end - seg_start)
+        paths = beat_photo_paths[i] if i < len(beat_photo_paths) else beat_photo_paths[-1]
+
+        # Swap photo mid-beat when beat > ~3.6s and we have a second real F1 photo (2.5-3.5s cuts!)
+        if len(paths) >= 2 and seg_dur >= max(3.5, PHOTO_SWAP_INTERVAL_SEC + 0.4):
+            mid = seg_start + seg_dur * 0.5
+            sub_pairs = [(seg_start, mid, paths[0]), (mid, seg_end, paths[1])]
+        else:
+            sub_pairs = [(seg_start, seg_end, paths[0])]
+
+        for s_start, s_end, p_path in sub_pairs:
+            composed = compose_full_bleed_vertical_photo(p_path, oversize_w, oversize_h)
+            shots.append(
+                PhotoShot(
+                    start=s_start,
+                    end=s_end,
+                    image=composed,
+                    zoom_in=(shot_idx % 2 == 0),
+                    pan_dir=(-1 if shot_idx % 3 == 0 else (1 if shot_idx % 3 == 1 else 0)),
+                )
+            )
+            shot_idx += 1
+
+    return shots
+
+
+def _render_ken_burns_frame(shot: PhotoShot, t: float) -> Image.Image:
+    """Apply smooth slow Ken Burns zoom/pan over a pre-composed full-bleed 1080x1920 F1 photo."""
+    dur = max(0.1, shot.end - shot.start)
+    u = min(1.0, max(0.0, (t - shot.start) / dur))
+    # Smooth ease-in-out
+    u_smooth = u * u * (3.0 - 2.0 * u)
+
+    ow, oh = shot.image.size  # 1210 x 2150 (~1.12x)
+    # Zoom between 1.00x and 1.09x crop window inside oversized source
+    scale = (1.09 - 0.08 * u_smooth) if shot.zoom_in else (1.01 + 0.08 * u_smooth)
+    crop_w = min(ow, int(VIDEO_WIDTH * scale))
+    crop_h = min(oh, int(VIDEO_HEIGHT * scale))
+
+    max_dx = max(0, ow - crop_w)
+    max_dy = max(0, oh - crop_h)
+
+    if shot.pan_dir > 0:
+        cx = int(max_dx * (0.15 + 0.70 * u_smooth))
+    elif shot.pan_dir < 0:
+        cx = int(max_dx * (0.85 - 0.70 * u_smooth))
+    else:
+        cx = max_dx // 2
+
+    cy = int(max_dy * (0.25 + 0.50 * u_smooth))
+    cropped = shot.image.crop((cx, cy, cx + crop_w, cy + crop_h))
+    if cropped.size != (VIDEO_WIDTH, VIDEO_HEIGHT):
+        cropped = cropped.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.BILINEAR)
+    return cropped
 
 
 def build_short_video(
@@ -843,34 +904,60 @@ def build_short_video(
     *,
     voice: str = TTS_VOICE,
     rate: str = TTS_RATE,
+    thumbnail_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Render a complete 9:16 1080x1920 30fps H.264 YouTube Short (< 60s)."""
+    """Render a complete 9:16 1080x1920 30fps H.264 YouTube Short (< 60s) + custom high-click thumbnail."""
     from moviepy import AudioFileClip, VideoClip
 
     ffmpeg_bin = _find_ffmpeg()
     assets = ensure_all_assets()
     fonts = assets["fonts"]
-    backgrounds = assets["backgrounds"]
     audio_assets = assets["audio"]
 
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
+    if thumbnail_path is None:
+        thumbnail_path = output_mp4.with_name(f"{output_mp4.stem}_thumbnail.jpg")
+
     primary_color_name = str(script_data.get("primary_team_color", "f1_red"))
     accent_rgb = _resolve_team_rgb(primary_color_name)
-    bg_path = backgrounds.get(_resolve_bg_key(primary_color_name), backgrounds["f1_red"])
+    category_label = str(script_data.get("category_label", "Formula 1"))
+
+    # 1. Fetch real, high-resolution, watermark-free F1 photos matched to every beat + hero thumbnail
+    hero_photo_path, beat_photo_paths = fetch_f1_photos_for_script(script_data)
+
+    # 2. Generate vibrant high-contrast 1080x1920 custom thumbnail image
+    thumb_hook = str(script_data.get("thumbnail_hook") or script_data.get("title") or "INSANE F1 STORY")
+    generate_high_click_thumbnail(
+        hero_photo_path=hero_photo_path,
+        hook_text=thumb_hook,
+        category_label=category_label,
+        accent_rgb=accent_rgb,
+        fonts=fonts,
+        output_path=thumbnail_path,
+    )
+    thumb_frame_np = np.array(Image.open(thumbnail_path).convert("RGB"))
 
     with tempfile.TemporaryDirectory(prefix="f1_short_build_") as tmp:
         work_dir = Path(tmp)
 
-        logger.info("Synthesizing voiceover (%s, rate=%s) + silenceremove...", voice, rate)
+        logger.info(
+            "Synthesizing slower, clearer voiceover (%s, rate=%s, pause=%.2fs)...",
+            voice,
+            rate,
+            INTER_BEAT_GAP_SEC,
+        )
         voice_wav, timed_beats, all_words, total_duration = asyncio.run(
             _build_timed_voiceover(script_data, work_dir, ffmpeg_bin, voice=voice, rate=rate)
         )
 
-        # Final hard safety check strictly under 60.0s
         if total_duration >= 60.0:
             raise RuntimeError(f"Duration check failed: {total_duration:.2f}s >= 60.0s")
 
-        logger.info("Mixing voiceover + -22 dB BGM + beat SFX (duration=%.2fs)...", total_duration)
+        # 3. Build full-bleed real F1 photo shot timeline (swapping every ~2.5-3.5s)
+        photo_shots = _build_photo_shots(timed_beats, beat_photo_paths, total_duration)
+        logger.info("Prepared %d full-bleed real F1 photo shots with Ken Burns motion.", len(photo_shots))
+
+        logger.info("Mixing voiceover + -22 dB BGM + pop/whoosh SFX (duration=%.2fs)...", total_duration)
         master_audio_path = work_dir / "master_audio.m4a"
         _mix_master_audio(
             voice_wav=voice_wav,
@@ -878,20 +965,17 @@ def build_short_video(
             whoosh_path=audio_assets["whoosh"],
             pop_path=audio_assets["pop"],
             timed_beats=timed_beats,
+            photo_shots=photo_shots,
             total_duration=total_duration,
             output_audio=master_audio_path,
             ffmpeg_bin=ffmpeg_bin,
         )
 
-        # Load tall scrollable background for subtle continuous vertical motion
-        bg_base = Image.open(bg_path).convert("RGB")
-        bg_oversized = bg_base.resize((VIDEO_WIDTH + 64, VIDEO_HEIGHT + 120), Image.Resampling.LANCZOS)
-
-        # Pre-render one RGBA overlay per visual beat (super fast frame compositing!)
-        category_label = str(script_data.get("category_label", "Formula 1"))
+        # Pre-render reusable cinema scrim & per-beat mid-video HUD overlays
+        cinema_scrim = _build_cinema_scrim()
         comment_prompt = str(script_data.get("comment_question", "")).strip()
         beat_overlays: list[Image.Image] = [
-            _render_beat_overlay(
+            _render_beat_hud_overlay(
                 beat=b,
                 category_label=category_label,
                 comment_prompt=comment_prompt,
@@ -905,38 +989,47 @@ def build_short_video(
         subtitle_font = _load_font(fonts["bold"], 64)
 
         def make_frame(t: float) -> np.ndarray:
-            # Subtle smooth parallax motion over dark-mode F1 background
-            progress = min(1.0, max(0.0, t / max(0.1, total_duration)))
-            dx = int(32 + 28 * math.sin(t * 0.45))
-            dy = int(110 * progress)
-            frame = bg_oversized.crop((dx, dy, dx + VIDEO_WIDTH, dy + VIDEO_HEIGHT)).convert("RGBA")
+            # First 0.15s: embed the high-click custom thumbnail directly as the opening frame!
+            if t < THUMBNAIL_FLASH_SEC:
+                return thumb_frame_np
 
-            # Find active visual beat
+            progress = min(1.0, max(0.0, t / max(0.1, total_duration)))
+
+            # Select active real F1 photo shot & render smooth Ken Burns motion
+            active_shot = photo_shots[-1]
+            for sh in photo_shots:
+                if t < sh.end:
+                    active_shot = sh
+                    break
+
+            photo_rgb = _render_ken_burns_frame(active_shot, t)
+            frame = Image.alpha_composite(photo_rgb.convert("RGBA"), cinema_scrim)
+
+            # Find active story beat & pop in mid-video attention badge
             active_beat_idx = len(timed_beats) - 1
             for i, b in enumerate(timed_beats):
-                if t <= b.end + 0.05:
+                if t <= b.end + INTER_BEAT_GAP_SEC * 0.5:
                     active_beat_idx = i
                     break
 
             beat_obj = timed_beats[active_beat_idx]
             overlay = beat_overlays[active_beat_idx]
 
-            # Quick crisp pop-in vertical slide during first 0.14s of each beat
             beat_age = max(0.0, t - beat_obj.start)
-            if beat_age < 0.14:
-                ease = 1.0 - (1.0 - beat_age / 0.14) ** 3
-                slide_y = int((1.0 - ease) * 36)
+            if beat_age < 0.16:
+                ease = 1.0 - (1.0 - beat_age / 0.16) ** 3
+                slide_y = int((1.0 - ease) * 32)
                 shifted = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
                 shifted.paste(overlay, (0, slide_y))
                 frame = Image.alpha_composite(frame, shifted)
             else:
                 frame = Image.alpha_composite(frame, overlay)
 
-            # Find active subtitle chunk and currently spoken word
+            # Crisp word-by-word highlighted captions
             active_chunk: list[TimedWord] | None = None
             active_word_idx = 0
             for ch in subtitle_chunks:
-                if ch[0].start - 0.05 <= t <= ch[-1].end + 0.12:
+                if ch[0].start - 0.06 <= t <= ch[-1].end + 0.16:
                     active_chunk = ch
                     for wi, w in enumerate(ch):
                         if t >= w.start - 0.03:
@@ -952,13 +1045,13 @@ def build_short_video(
                     subtitle_font,
                 )
 
-            # Sleek top retention progress bar (at y=166, right above safe badge)
+            # Sleek top retention progress bar (y=172)
             pdraw = ImageDraw.Draw(frame, "RGBA")
-            bar_x0, bar_x1, bar_y = SAFE_LEFT, SAFE_RIGHT, 174
-            pdraw.rounded_rectangle([bar_x0, bar_y, bar_x1, bar_y + 8], radius=4, fill=(255, 255, 255, 38))
+            bar_x0, bar_x1, bar_y = SAFE_LEFT, SAFE_RIGHT, 172
+            pdraw.rounded_rectangle([bar_x0, bar_y, bar_x1, bar_y + 8], radius=4, fill=(255, 255, 255, 55))
             fill_x = bar_x0 + int((bar_x1 - bar_x0) * progress)
             ar, ag, ab = accent_rgb
-            pdraw.rounded_rectangle([bar_x0, bar_y, max(bar_x0 + 8, fill_x), bar_y + 8], radius=4, fill=(ar, ag, ab, 245))
+            pdraw.rounded_rectangle([bar_x0, bar_y, max(bar_x0 + 8, fill_x), bar_y + 8], radius=4, fill=(ar, ag, ab, 250))
 
             return np.array(frame.convert("RGB"))
 
@@ -973,7 +1066,7 @@ def build_short_video(
                 codec="libx264",
                 audio_codec="aac",
                 audio_bitrate="192k",
-                preset="medium",
+                preset="veryfast",
                 threads=4,
                 ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
                 logger=None,
@@ -982,7 +1075,6 @@ def build_short_video(
             audio_clip.close()
             video_clip.close()
 
-    # Final post-export duration verification directly on the output MP4
     exported_duration = get_audio_duration(output_mp4, ffmpeg_bin)
     if exported_duration >= 60.0:
         output_mp4.unlink(missing_ok=True)
@@ -991,17 +1083,21 @@ def build_short_video(
         )
 
     logger.info(
-        "Rendered Short verified: %s (1080x1920, %dfps, %.2fs)",
+        "Rendered Short verified: %s (1080x1920, %dfps, %.2fs, %d real F1 photo shots, thumbnail=%s)",
         output_mp4.name,
         VIDEO_FPS,
         exported_duration,
+        len(photo_shots),
+        thumbnail_path.name,
     )
     return {
         "video_path": str(output_mp4),
+        "thumbnail_path": str(thumbnail_path),
         "duration_sec": round(exported_duration, 2),
         "width": VIDEO_WIDTH,
         "height": VIDEO_HEIGHT,
         "fps": VIDEO_FPS,
         "beat_count": len(timed_beats),
+        "photo_shot_count": len(photo_shots),
         "word_count": len(all_words),
     }

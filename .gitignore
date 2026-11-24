@@ -10,6 +10,7 @@ logs/
 assets/backgrounds/
 assets/fonts/
 assets/audio/
+assets/photos/
 *.mp4
 *.mov
 *.mp3

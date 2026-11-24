@@ -274,11 +274,24 @@ async def run_structured_agent_prompt(
     ) from last_error
 
 
+STORY_ANGLE_LENSES = [
+    "Focus on an unexpected underdog, rookie, or midfield team moment rather than the most obvious cliché.",
+    "Focus on a jaw-dropping human reaction, split-second decision, or cockpit physical extreme.",
+    "Focus on a wild behind-the-scenes paddock gamble, mind game, or high-stakes controversy.",
+    "Focus on a crazy numerical record or rule quirk translated into an everyday real-world comparison.",
+    "Focus on a dramatic race-day turning point flipped by weather, pit-wall chaos, or sheer luck.",
+    "Focus on a classic 1980s-2010s iconic F1 moment that modern fans rarely hear told this clearly.",
+    "Focus on a sharp modern-era (2021-2026) moment with huge fan debate potential.",
+]
+
+
 async def _discover_topic_for_category(
     category: dict[str, Any],
     history_store: HistoryStore,
     reserved_topics: list[dict[str, str]],
     live_headlines_cache: str,
+    angle_lens: str,
+    run_seed: int,
     max_attempts: int = 3,
 ) -> dict[str, Any]:
     """Select 1 verified, non-repeating F1 topic in a single fast quota-friendly LLM call."""
@@ -294,9 +307,11 @@ async def _discover_topic_for_category(
         "You are an obsessive, viral Formula 1 YouTube Shorts producer. "
         "Pick stories with massive mainstream curiosity—human stakes, ego, chaos, speed, danger, "
         "or outrageous loopholes—never boring engineering lectures. "
-        "Use ONLY verified facts from the provided live F1 news feeds (for current paddock news/drama) "
-        "or well-established, rock-solid Formula 1 historical/rule records (for history, facts, and debates). "
-        "Return ONLY valid JSON matching the requested schema."
+        "CRITICAL ZERO-REPEAT RULE: Read EVERY banned title, topic slug, angle, and keyword listed in "
+        "PERMANENT UPLOAD HISTORY. You are STRICTLY FORBIDDEN from picking any previously covered topic, "
+        "the same driver-specific incident, or any similar angle. Pick a completely fresh story with zero overlap. "
+        "Use ONLY verified facts from the provided live F1 news feeds (for current 2026 drama) "
+        "or rock-solid Formula 1 historical/rule records. Return ONLY valid JSON matching the requested schema."
     )
 
     rejection_notes: list[str] = []
@@ -307,22 +322,24 @@ async def _discover_topic_for_category(
             if category.get("requires_live_news")
             else (
                 f"\nToday's date is {today_str}. Pick an unforgettable, high-retention Formula 1 story "
-                "from established F1 history, FIA rules, or iconic rivalries (100% accurate facts only)."
+                "from established F1 history, FIA rules, driver extremes, or iconic rivalries (100% accurate facts only)."
             )
         )
 
         retry_section = (
-            "\n\nPREVIOUS REJECTED ATTEMPTS (DO NOT REPEAT):\n" + "\n".join(f"- {r}" for r in rejection_notes)
+            "\n\nPREVIOUS REJECTED ATTEMPTS (DO NOT REPEAT OR REPHRASE):\n" + "\n".join(f"- {r}" for r in rejection_notes)
             if rejection_notes
             else ""
         )
 
         prompt = (
-            f"Select ONE killer, non-repeating Formula 1 YouTube Short topic.\n\n"
+            f"Select ONE completely brand-new, non-repeating Formula 1 YouTube Short topic.\n\n"
+            f"RANDOMIZATION SEED: #{run_seed} (attempt {attempt})\n"
             f"CATEGORY: {category['label']}\n"
             f"CATEGORY FOCUS: {category['description']}\n"
+            f"CREATIVE ANGLE LENS FOR VARIETY: {angle_lens}\n"
             f"{live_news_block}\n"
-            f"PERMANENT UPLOAD HISTORY (STRICTLY FORBIDDEN TO REPEAT ANY TOPIC OR CORE FACT):\n"
+            f"PERMANENT UPLOAD HISTORY — STRICT EXCLUSION LIST (BAN ALL LISTED TOPICS, DRIVER-INCIDENTS & SIMILAR ANGLES):\n"
             f"{history_ledger}\n\n"
             f"ALREADY SELECTED FOR TODAY'S RUN (DO NOT OVERLAP):\n"
             f"{reserved_block}"
@@ -331,8 +348,9 @@ async def _discover_topic_for_category(
         )
 
         logger.info(
-            "Generating unique topic for category '%s' (attempt %d/%d)...",
+            "Generating unique topic for category '%s' [seed=%d] (attempt %d/%d)...",
             category["label"],
+            run_seed,
             attempt,
             max_attempts,
         )
@@ -362,11 +380,11 @@ async def _discover_topic_for_category(
             topic_dict["topic_slug"] = norm_slug
             topic_dict["category"] = category["id"]
             topic_dict["category_label"] = category["label"]
-            logger.info("Verified unique topic [%s]: %s", category["id"], norm_slug)
+            logger.info("Verified unique topic [%s]: %s (passed >40%% anti-repeat check)", category["id"], norm_slug)
             return topic_dict
 
-        logger.warning("Topic '%s' rejected for overlap: %s", norm_slug, reason)
-        rejection_notes.append(f"{norm_slug} ({candidate.working_title}) -> rejected: {reason}")
+        logger.warning("Topic '%s' rejected for >40%% overlap: %s", norm_slug, reason)
+        rejection_notes.append(f"{norm_slug} ({candidate.working_title}) -> REJECTED: {reason}")
 
     raise RuntimeError(
         f"Failed to generate a non-repeating topic for category '{category['label']}' after {max_attempts} attempts."
@@ -374,21 +392,37 @@ async def _discover_topic_for_category(
 
 
 async def _generate_unique_topics_async(history_store: HistoryStore, count: int = 2) -> list[dict[str, Any]]:
-    chosen_categories = random.sample(F1_CATEGORIES, k=min(count, len(F1_CATEGORIES)))
+    sys_rng = random.SystemRandom()
+    recent_cats = set(history_store.get_recent_categories(limit=4))
+
+    # Prefer categories NOT used in recent uploads so consecutive Shorts feel genuinely varied
+    fresh_pool = [c for c in F1_CATEGORIES if c["id"] not in recent_cats]
+    fallback_pool = [c for c in F1_CATEGORIES if c["id"] in recent_cats]
+    sys_rng.shuffle(fresh_pool)
+    sys_rng.shuffle(fallback_pool)
+
+    target_n = min(count, len(F1_CATEGORIES))
+    chosen_categories = (fresh_pool + fallback_pool)[:target_n]
+    chosen_lenses = sys_rng.sample(STORY_ANGLE_LENSES, k=min(target_n, len(STORY_ANGLE_LENSES)))
+
     live_headlines_cache = ""
     if any(cat.get("requires_live_news") for cat in chosen_categories):
-        logger.info("Pre-fetching live F1 headlines (BBC/ESPN/Autosport/Motorsport)...")
+        logger.info("Pre-fetching live 2026 F1 headlines (BBC/ESPN/Autosport/Motorsport)...")
         live_headlines_cache = fetch_live_f1_headlines(max_per_feed=5)
 
     selected: list[dict[str, Any]] = []
     reserved: list[dict[str, str]] = []
 
-    for cat in chosen_categories:
+    for idx, cat in enumerate(chosen_categories):
+        run_seed = sys_rng.randint(10_000, 999_999)
+        lens = chosen_lenses[idx % len(chosen_lenses)]
         topic = await _discover_topic_for_category(
             cat,
             history_store,
             reserved_topics=reserved,
             live_headlines_cache=live_headlines_cache,
+            angle_lens=lens,
+            run_seed=run_seed,
         )
         selected.append(topic)
         reserved.append(

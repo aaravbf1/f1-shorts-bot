@@ -8,6 +8,7 @@ import os
 import shutil
 import socket
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -154,6 +155,60 @@ def _check_quota_error(err: HttpError) -> None:
         ) from err
 
 
+def _wait_for_video_processing(youtube, video_id: str, max_wait_sec: int = 45) -> str:
+    """Poll YouTube processingDetails briefly until processing completes or timeout is reached."""
+    deadline = time.monotonic() + max_wait_sec
+    last_status = "unknown"
+    while time.monotonic() < deadline:
+        try:
+            resp = youtube.videos().list(part="processingDetails,status", id=video_id).execute(num_retries=2)
+            items = resp.get("items", [])
+            if items:
+                proc = items[0].get("processingDetails", {})
+                status = str(proc.get("processingStatus", "")).lower()
+                if status:
+                    last_status = status
+                if status in {"succeeded", "failed", "terminated"}:
+                    return status
+        except HttpError as err:
+            _check_quota_error(err)
+            logger.debug("Processing poll warning for %s: %s", video_id, err)
+            break
+        except Exception as exc:
+            logger.debug("Processing poll error for %s: %s", video_id, exc)
+            break
+        time.sleep(5)
+    return last_status
+
+
+def _set_custom_thumbnail(youtube, video_id: str, thumbnail_path: Path) -> bool:
+    """Set custom thumbnail via thumbnails().set() after upload processing completes."""
+    if not thumbnail_path or not thumbnail_path.exists():
+        return False
+
+    proc_status = _wait_for_video_processing(youtube, video_id, max_wait_sec=45)
+    logger.info("Video %s processing status before thumbnail upload: %s", video_id, proc_status)
+
+    mime = "image/png" if thumbnail_path.suffix.lower() == ".png" else "image/jpeg"
+    try:
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=MediaFileUpload(str(thumbnail_path), mimetype=mime, resumable=False),
+        ).execute(num_retries=2)
+        logger.info("Custom thumbnail set successfully for video %s (%s)", video_id, thumbnail_path.name)
+        print(f"Custom thumbnail uploaded for {video_id}: {thumbnail_path.name}", flush=True)
+        return True
+    except HttpError as err:
+        _check_quota_error(err)
+        logger.warning(
+            "YouTube thumbnails().set() returned HTTP %s for %s (embedded 0.15s thumbnail frame still active): %s",
+            getattr(err.resp, "status", "?"),
+            video_id,
+            err,
+        )
+        return False
+
+
 def upload_short(
     youtube,
     *,
@@ -162,12 +217,9 @@ def upload_short(
     history_store: HistoryStore,
     privacy_status: str = YOUTUBE_PRIVACY_STATUS,
     metadata_json_path: Path | None = None,
+    thumbnail_path: Path | None = None,
 ) -> str:
-    """Upload a single 9:16 Short via resumable videos().insert, record to history, and archive.
-
-    NOTE: Explicitly does NOT call thumbnails().set because YouTube Data API v3
-    rejects custom thumbnails on Shorts uploads.
-    """
+    """Upload a single 9:16 Short via resumable videos().insert, set custom thumbnail, record to history, and archive."""
     if not video_path.exists():
         raise FileNotFoundError(f"Rendered Short not found: {video_path}")
 
@@ -223,6 +275,10 @@ def upload_short(
     logger.info("Upload succeeded! Video ID: %s | URL: https://youtube.com/shorts/%s", video_id, video_id)
     print(f"Uploaded Short: {title} -> https://youtube.com/shorts/{video_id} (privacy={privacy_status})", flush=True)
 
+    # Attempt custom thumbnail upload after processing completes
+    if thumbnail_path and thumbnail_path.exists():
+        _set_custom_thumbnail(youtube, video_id, thumbnail_path)
+
     # Record permanently in history.json
     history_store.record_upload(
         topic_slug=metadata["topic_slug"],
@@ -232,11 +288,16 @@ def upload_short(
         angle=metadata.get("angle", ""),
     )
 
-    # Archive rendered video + metadata JSON into uploaded/
+    # Archive rendered video, thumbnail, and metadata JSON into uploaded/
     UPLOADED_DIR.mkdir(parents=True, exist_ok=True)
     archived_video = UPLOADED_DIR / f"{video_id}_{video_path.name}"
     shutil.move(str(video_path), str(archived_video))
     logger.info("Archived video to %s", archived_video)
+
+    if thumbnail_path and thumbnail_path.exists():
+        archived_thumb = UPLOADED_DIR / f"{video_id}_{thumbnail_path.name}"
+        shutil.move(str(thumbnail_path), str(archived_thumb))
+        logger.info("Archived thumbnail to %s", archived_thumb)
 
     if metadata_json_path and metadata_json_path.exists():
         meta_copy = json.loads(metadata_json_path.read_text(encoding="utf-8"))
