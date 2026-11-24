@@ -8,7 +8,9 @@ import math
 import random
 import re
 import struct
+import time
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -171,11 +173,10 @@ def _is_valid_photo_candidate(title: str, width: int, height: int, mime: str) ->
 
 
 def _search_wikimedia_commons(query: str, limit: int = 12) -> list[dict[str, Any]]:
-    """Query Wikimedia Commons API for high-res (>=800px) real Formula 1 photographs."""
+    """Query Wikimedia Commons API for high-res (>=800px) real Formula 1 photographs with strict timeout."""
     clean_q = re.sub(r"[^\w\s\-']", " ", query).strip()
     if not clean_q:
         return []
-    # Keep Wikimedia search crisp (3-5 focused tokens) so it hits genuine Formula 1 car/driver photos
     tokens = [t for t in clean_q.split() if len(t) > 1]
     if len(tokens) > 5:
         tokens = tokens[:5]
@@ -198,7 +199,7 @@ def _search_wikimedia_commons(query: str, limit: int = 12) -> list[dict[str, Any
                 "iiurlwidth": 1600,
             },
             headers=WIKIMEDIA_HEADERS,
-            timeout=HTTP_TIMEOUT_SEC,
+            timeout=(6, min(12, HTTP_TIMEOUT_SEC)),
         )
         resp.raise_for_status()
         pages = resp.json().get("query", {}).get("pages", {})
@@ -289,7 +290,7 @@ def _download_verified_photo(url: str) -> Path | None:
             cached_jpg.unlink(missing_ok=True)
 
     try:
-        resp = requests.get(url, headers=WIKIMEDIA_HEADERS, timeout=HTTP_TIMEOUT_SEC)
+        resp = requests.get(url, headers=WIKIMEDIA_HEADERS, timeout=(6, min(14, HTTP_TIMEOUT_SEC)))
         resp.raise_for_status()
         raw_path = PHOTOS_DIR / f"tmp_{url_hash}.bin"
         raw_path.write_bytes(resp.content)
@@ -326,76 +327,114 @@ def _pick_photo_for_query(query: str, used_urls: set[str]) -> Path | None:
     return None
 
 
+def _fetch_candidate_pool_for_query(query: str, max_downloads: int = 2) -> list[Path]:
+    """Fetch up to `max_downloads` verified high-res F1 photos for a query within a strict 15s cap."""
+    deadline = time.monotonic() + 15.0
+    candidates = _search_wikimedia_commons(query, limit=10)
+    if len(candidates) < 2 and time.monotonic() < deadline - 4.0:
+        candidates.extend(_search_wikipedia_pageimages(query, limit=4))
+
+    results: list[Path] = []
+    seen_urls: set[str] = set()
+    for cand in candidates:
+        if len(results) >= max_downloads or time.monotonic() >= deadline:
+            break
+        url = cand["url"]
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        downloaded = _download_verified_photo(url)
+        if downloaded:
+            results.append(downloaded)
+    return results
+
+
 def fetch_f1_photos_for_script(script_data: dict[str, Any]) -> tuple[Path, list[list[Path]]]:
-    """Fetch real, high-resolution, watermark-free F1 photos matched to the hero thumbnail & every beat.
-
-    Returns:
-        (hero_photo_path, beat_photos_per_beat)
-        where each beat gets 1-2 distinct real F1 photos so visuals cut smoothly every 2.5-3.5 seconds.
-    """
+    """Concurrently fetch real, high-res, watermark-free F1 photos with strict timeouts and instant fallbacks."""
     ensure_directories()
-    used_urls: set[str] = set()
-    used_paths: set[Path] = set()
-    fallback_pool: list[Path] = []
-    fallback_idx = 0
+    t0 = time.monotonic()
 
-    def _get_fallback_photo() -> Path:
-        nonlocal fallback_idx
-        while fallback_idx < len(FALLBACK_F1_PHOTO_QUERIES):
-            q = FALLBACK_F1_PHOTO_QUERIES[fallback_idx]
-            fallback_idx += 1
-            p = _pick_photo_for_query(q, used_urls)
-            if p and p not in used_paths:
-                used_paths.add(p)
-                fallback_pool.append(p)
-                return p
-        # Reuse cached local photos if network is completely restricted
-        existing = [p for p in PHOTOS_DIR.glob("f1_*.jpg") if p.stat().st_size > 15_000]
-        if existing:
-            return random.choice(existing)
-        # Absolute last resort: dark F1 background
-        bgs = ensure_backgrounds()
-        return bgs["f1_red"]
-
-    # 1. Fetch main hero photo for the high-click custom thumbnail
     hero_query = str(
         script_data.get("hero_photo_query")
         or (script_data.get("beats") or [{}])[0].get("photo_query")
         or script_data.get("title")
         or "Formula One race car"
     )
-    logger.info("Fetching real high-res hero F1 photo for thumbnail: '%s'", hero_query)
-    hero_photo = _pick_photo_for_query(hero_query, used_urls) or _get_fallback_photo()
-    used_paths.add(hero_photo)
-
-    # 2. Fetch 1-2 distinct matched real F1 photos per beat
     beats = script_data.get("beats", [])
-    beat_photos: list[list[Path]] = []
+
+    # Build deduplicated query list: hero + each beat's primary/secondary queries + 4 safety fallbacks
+    query_tasks: dict[str, str] = {"hero": hero_query}
     for idx, beat in enumerate(beats):
         q1 = str(beat.get("photo_query") or hero_query).strip()
         q2 = str(beat.get("secondary_photo_query") or "").strip()
-
-        p1 = _pick_photo_for_query(q1, used_urls)
-        if not p1 or p1 in used_paths:
-            p1 = _get_fallback_photo()
-        used_paths.add(p1)
-
-        photos_this_beat = [p1]
+        query_tasks[f"beat_{idx}_a"] = q1
         if q2:
-            p2 = _pick_photo_for_query(q2, used_urls)
-            if p2 and p2 not in used_paths:
-                used_paths.add(p2)
-                photos_this_beat.append(p2)
-        else:
-            # Grab a second real photo for longer beats so photos swap every ~2.5-3.5s
-            p2 = _pick_photo_for_query(f"{q1} race", used_urls)
-            if p2 and p2 not in used_paths:
-                used_paths.add(p2)
-                photos_this_beat.append(p2)
+            query_tasks[f"beat_{idx}_b"] = q2
+    for fi, fq in enumerate(FALLBACK_F1_PHOTO_QUERIES[:4]):
+        query_tasks[f"fallback_{fi}"] = fq
 
-        beat_photos.append(photos_this_beat)
-        logger.info("Beat %d/%d photos ready (%d real F1 photo(s)) for query '%s'", idx + 1, len(beats), len(photos_this_beat), q1)
+    fetched_by_key: dict[str, list[Path]] = {}
+    logger.info("Concurrently fetching real F1 photos for %d queries (15s timeout/query)...", len(query_tasks))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        future_map = {
+            pool.submit(_fetch_candidate_pool_for_query, q, 2 if k.endswith("_a") or k == "hero" else 1): k
+            for k, q in query_tasks.items()
+        }
+        try:
+            for fut in as_completed(future_map, timeout=50.0):
+                key = future_map[fut]
+                try:
+                    fetched_by_key[key] = fut.result(timeout=1.0)
+                except Exception as exc:
+                    logger.debug("Photo task %s skipped: %s", key, exc)
+                    fetched_by_key[key] = []
+        except Exception as exc:
+            logger.warning("Global photo fetch budget reached (%.1fs): %s — proceeding with fetched + cached photos.", time.monotonic() - t0, exc)
 
+    # Assemble unique fallback pool from all downloaded + cached photos
+    all_valid_pool: list[Path] = []
+    for paths in fetched_by_key.values():
+        for p in paths:
+            if p not in all_valid_pool:
+                all_valid_pool.append(p)
+    for cached in sorted(PHOTOS_DIR.glob("f1_*.jpg")):
+        if cached.stat().st_size > 15_000 and cached not in all_valid_pool:
+            all_valid_pool.append(cached)
+
+    used_paths: set[Path] = set()
+    pool_cursor = 0
+
+    def _take_unused(preferred: list[Path]) -> Path:
+        nonlocal pool_cursor
+        for p in preferred:
+            if p not in used_paths:
+                used_paths.add(p)
+                return p
+        while pool_cursor < len(all_valid_pool):
+            cand = all_valid_pool[pool_cursor]
+            pool_cursor += 1
+            if cand not in used_paths:
+                used_paths.add(cand)
+                return cand
+        if all_valid_pool:
+            return random.choice(all_valid_pool)
+        return ensure_backgrounds()["f1_red"]
+
+    hero_photo = _take_unused(fetched_by_key.get("hero", []))
+    beat_photos: list[list[Path]] = []
+    for idx in range(len(beats)):
+        primary_list = fetched_by_key.get(f"beat_{idx}_a", [])
+        secondary_list = fetched_by_key.get(f"beat_{idx}_b", [])
+        p1 = _take_unused(primary_list)
+        p2 = _take_unused(secondary_list + primary_list)
+        beat_photos.append([p1, p2] if p2 != p1 else [p1])
+
+    logger.info(
+        "Prepared hero + %d real F1 beat photo sets in %.1fs (pool=%d verified photos).",
+        len(beat_photos),
+        time.monotonic() - t0,
+        len(all_valid_pool),
+    )
     return hero_photo, beat_photos
 
 

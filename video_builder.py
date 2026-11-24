@@ -6,9 +6,11 @@ import asyncio
 import inspect
 import logging
 import math
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -971,8 +973,9 @@ def build_short_video(
             ffmpeg_bin=ffmpeg_bin,
         )
 
-        # Pre-render reusable cinema scrim & per-beat mid-video HUD overlays
+        # Pre-split scrim & per-beat HUDs into fast RGB + L alpha masks (eliminates RGBA conversions per frame!)
         cinema_scrim = _build_cinema_scrim()
+        scrim_rgb, scrim_alpha = cinema_scrim.convert("RGB"), cinema_scrim.getchannel("A")
         comment_prompt = str(script_data.get("comment_question", "")).strip()
         beat_overlays: list[Image.Image] = [
             _render_beat_hud_overlay(
@@ -984,9 +987,37 @@ def build_short_video(
             )
             for i, b in enumerate(timed_beats)
         ]
+        beat_overlay_pairs: list[tuple[Image.Image, Image.Image]] = [
+            (ov.convert("RGB"), ov.getchannel("A")) for ov in beat_overlays
+        ]
+        beat_static_pairs: list[tuple[Image.Image, Image.Image]] = []
+        for ov in beat_overlays:
+            merged = Image.alpha_composite(cinema_scrim, ov)
+            beat_static_pairs.append((merged.convert("RGB"), merged.getchannel("A")))
 
         subtitle_chunks = _build_subtitle_chunks(all_words, chunk_size=3)
         subtitle_font = _load_font(fonts["bold"], 64)
+
+        # Cache rendered subtitle patches by (chunk_idx, active_word_idx, accent_rgb) so text renders ONCE per word!
+        sub_y0, sub_y1 = 1040, 1410
+        subtitle_cache: dict[tuple[int, int, tuple[int, int, int]], tuple[Image.Image, Image.Image]] = {}
+
+        def _get_subtitle_patch(
+            ch_idx: int,
+            chunk: list[TimedWord],
+            active_word_idx: int,
+            color: tuple[int, int, int],
+        ) -> tuple[Image.Image, Image.Image]:
+            key = (ch_idx, active_word_idx, color)
+            cached = subtitle_cache.get(key)
+            if cached is not None:
+                return cached
+            tmp_rgba = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
+            _draw_active_subtitle(tmp_rgba, chunk, active_word_idx, color, subtitle_font)
+            band = tmp_rgba.crop((0, sub_y0, VIDEO_WIDTH, sub_y1))
+            pair = (band.convert("RGB"), band.getchannel("A"))
+            subtitle_cache[key] = pair
+            return pair
 
         def make_frame(t: float) -> np.ndarray:
             # First 0.15s: embed the high-click custom thumbnail directly as the opening frame!
@@ -995,17 +1026,16 @@ def build_short_video(
 
             progress = min(1.0, max(0.0, t / max(0.1, total_duration)))
 
-            # Select active real F1 photo shot & render smooth Ken Burns motion
+            # Select active real F1 photo shot & render smooth Ken Burns motion (stays pure RGB!)
             active_shot = photo_shots[-1]
             for sh in photo_shots:
                 if t < sh.end:
                     active_shot = sh
                     break
 
-            photo_rgb = _render_ken_burns_frame(active_shot, t)
-            frame = Image.alpha_composite(photo_rgb.convert("RGBA"), cinema_scrim)
+            frame = _render_ken_burns_frame(active_shot, t)
 
-            # Find active story beat & pop in mid-video attention badge
+            # Find active story beat & paste pre-composited HUD directly on RGB frame
             active_beat_idx = len(timed_beats) - 1
             for i, b in enumerate(timed_beats):
                 if t <= b.end + INTER_BEAT_GAP_SEC * 0.5:
@@ -1013,49 +1043,41 @@ def build_short_video(
                     break
 
             beat_obj = timed_beats[active_beat_idx]
-            overlay = beat_overlays[active_beat_idx]
-
             beat_age = max(0.0, t - beat_obj.start)
+
             if beat_age < 0.16:
+                frame.paste(scrim_rgb, (0, 0), scrim_alpha)
                 ease = 1.0 - (1.0 - beat_age / 0.16) ** 3
                 slide_y = int((1.0 - ease) * 32)
-                shifted = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (0, 0, 0, 0))
-                shifted.paste(overlay, (0, slide_y))
-                frame = Image.alpha_composite(frame, shifted)
+                ov_rgb, ov_a = beat_overlay_pairs[active_beat_idx]
+                frame.paste(ov_rgb, (0, slide_y), ov_a)
             else:
-                frame = Image.alpha_composite(frame, overlay)
+                hud_rgb, hud_a = beat_static_pairs[active_beat_idx]
+                frame.paste(hud_rgb, (0, 0), hud_a)
 
-            # Crisp word-by-word highlighted captions
-            active_chunk: list[TimedWord] | None = None
-            active_word_idx = 0
-            for ch in subtitle_chunks:
+            # Paste cached highlighted subtitle band (tiny 1080x370 ROI!)
+            for ch_idx, ch in enumerate(subtitle_chunks):
                 if ch[0].start - 0.06 <= t <= ch[-1].end + 0.16:
-                    active_chunk = ch
+                    active_word_idx = 0
                     for wi, w in enumerate(ch):
                         if t >= w.start - 0.03:
                             active_word_idx = wi
+                    sub_rgb, sub_a = _get_subtitle_patch(ch_idx, ch, active_word_idx, beat_obj.accent_rgb)
+                    frame.paste(sub_rgb, (0, sub_y0), sub_a)
                     break
 
-            if active_chunk:
-                _draw_active_subtitle(
-                    frame,
-                    active_chunk,
-                    active_word_idx,
-                    beat_obj.accent_rgb,
-                    subtitle_font,
-                )
-
-            # Sleek top retention progress bar (y=172)
-            pdraw = ImageDraw.Draw(frame, "RGBA")
+            # Sleek top retention progress bar (y=172) drawn directly on RGB
+            pdraw = ImageDraw.Draw(frame)
             bar_x0, bar_x1, bar_y = SAFE_LEFT, SAFE_RIGHT, 172
-            pdraw.rounded_rectangle([bar_x0, bar_y, bar_x1, bar_y + 8], radius=4, fill=(255, 255, 255, 55))
+            pdraw.rounded_rectangle([bar_x0, bar_y, bar_x1, bar_y + 8], radius=4, fill=(70, 74, 84))
             fill_x = bar_x0 + int((bar_x1 - bar_x0) * progress)
-            ar, ag, ab = accent_rgb
-            pdraw.rounded_rectangle([bar_x0, bar_y, max(bar_x0 + 8, fill_x), bar_y + 8], radius=4, fill=(ar, ag, ab, 250))
+            pdraw.rounded_rectangle([bar_x0, bar_y, max(bar_x0 + 8, fill_x), bar_y + 8], radius=4, fill=accent_rgb)
 
-            return np.array(frame.convert("RGB"))
+            return np.asarray(frame)
 
-        logger.info("Rendering 1080x1920 30fps H.264 MP4 -> %s", output_mp4.name)
+        render_t0 = time.monotonic()
+        render_threads = max(2, os.cpu_count() or 4)
+        logger.info("Rendering 1080x1920 30fps H.264 MP4 (%d threads, ultrafast) -> %s", render_threads, output_mp4.name)
         video_clip = VideoClip(make_frame, duration=total_duration)
         audio_clip = AudioFileClip(str(master_audio_path))
         try:
@@ -1066,14 +1088,15 @@ def build_short_video(
                 codec="libx264",
                 audio_codec="aac",
                 audio_bitrate="192k",
-                preset="veryfast",
-                threads=4,
-                ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+                preset="ultrafast",
+                threads=render_threads,
+                ffmpeg_params=["-crf", "22", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
                 logger=None,
             )
         finally:
             audio_clip.close()
             video_clip.close()
+        logger.info("Video encode completed in %.1fs.", time.monotonic() - render_t0)
 
     exported_duration = get_audio_duration(output_mp4, ffmpeg_bin)
     if exported_duration >= 60.0:

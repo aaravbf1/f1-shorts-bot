@@ -7,20 +7,12 @@ import json
 import logging
 import random
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Any, TypeVar
 
 import requests
-from google.antigravity import (
-    Agent,
-    BuiltinTools,
-    CapabilitiesConfig,
-    LocalAgentConfig,
-    ModelAPIRetryConfig,
-    ModelOutputRetryConfig,
-    RetryConfig,
-)
 from pydantic import BaseModel, Field
 
 from config import (
@@ -32,6 +24,7 @@ from config import (
     GEMINI_API_KEY,
     HTTP_TIMEOUT_SEC,
     LLM_CALL_TIMEOUT_SEC,
+    USE_DIRECT_GEMINI_API,
     VERTEX_ENABLED,
 )
 from history_store import HistoryStore, slugify
@@ -39,6 +32,9 @@ from history_store import HistoryStore, slugify
 logger = logging.getLogger(__name__)
 
 TModel = TypeVar("TModel", bound=BaseModel)
+
+# In-run cache of models that returned 429 quota exhaustion so later calls skip them instantly
+_EXHAUSTED_MODELS: set[str] = set()
 
 LIVE_F1_RSS_FEEDS = [
     ("BBC Sport F1", "https://feeds.bbci.co.uk/sport/formula1/rss.xml"),
@@ -151,8 +147,17 @@ def build_antigravity_config(
     response_schema: type[BaseModel] | None = None,
     extra_tools: list[Any] | None = None,
     model_name: str = ANTIGRAVITY_MODEL,
-) -> LocalAgentConfig:
-    """Construct a fail-fast LocalAgentConfig with bounded retries so 429/503 never hangs CI."""
+):
+    """Construct a fail-fast LocalAgentConfig (used only when running local Antigravity SDK mode)."""
+    from google.antigravity import (
+        BuiltinTools,
+        CapabilitiesConfig,
+        LocalAgentConfig,
+        ModelAPIRetryConfig,
+        ModelOutputRetryConfig,
+        RetryConfig,
+    )
+
     enabled_tools = (
         [BuiltinTools.SEARCH_WEB, BuiltinTools.READ_URL_CONTENT, BuiltinTools.VIEW_FILE]
         if enable_web_search
@@ -165,7 +170,6 @@ def build_antigravity_config(
             enable_subagents=False,
             enabled_tools=enabled_tools,
         ),
-        # Cap retries tightly so a free-tier 429 RetryInfo (e.g. 3.5h) fails fast instead of hanging!
         "retry_config": RetryConfig(
             api_retry=ModelAPIRetryConfig(
                 max_retries=1,
@@ -205,6 +209,116 @@ def extract_json_payload(raw_text: str) -> dict[str, Any]:
     return json.loads(cleaned)
 
 
+def _call_direct_gemini_rest(
+    *,
+    system_instructions: str,
+    prompt: str,
+    schema_cls: type[TModel],
+    timeout_sec: float = LLM_CALL_TIMEOUT_SEC,
+    retries_per_model: int = 2,
+) -> TModel:
+    """Call official Google Gemini REST API directly with strict 30s timeouts, 2 retries, and instant 429 failover."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is required for direct Gemini API calls.")
+
+    schema_json = json.dumps(schema_cls.model_json_schema(), ensure_ascii=False)
+    full_system = (
+        f"{system_instructions}\n\n"
+        "OUTPUT FORMAT: Respond with ONLY a single valid JSON object matching this exact JSON Schema "
+        f"(no markdown, no explanation, no extra keys):\n{schema_json}"
+    )
+
+    payload = {
+        "system_instruction": {"parts": [{"text": full_system}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.9,
+            "maxOutputTokens": 8192,
+        },
+    }
+
+    all_models = get_model_chain()
+    models = [m for m in all_models if m not in _EXHAUSTED_MODELS] or all_models
+    last_error: Exception | None = None
+    http_timeout = (8.0, float(min(30.0, max(15.0, timeout_sec))))
+
+    for m_idx, model_name in enumerate(models, start=1):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        for attempt in range(1, retries_per_model + 1):
+            t0 = time.monotonic()
+            try:
+                logger.info(
+                    "Direct Gemini API -> '%s' (model %d/%d, try %d/%d, timeout=%.0fs)...",
+                    model_name,
+                    m_idx,
+                    len(models),
+                    attempt,
+                    retries_per_model,
+                    http_timeout[1],
+                )
+                resp = requests.post(
+                    url,
+                    params={"key": GEMINI_API_KEY},
+                    json=payload,
+                    timeout=http_timeout,
+                )
+                dt = time.monotonic() - t0
+
+                if resp.status_code == 429:
+                    _EXHAUSTED_MODELS.add(model_name)
+                    last_error = RuntimeError(f"HTTP 429 quota exhausted on '{model_name}': {resp.text[:160]}")
+                    logger.warning("Model '%s' hit HTTP 429 quota (%.1fs) — cached as exhausted & failing over.", model_name, dt)
+                    break  # Instant failover to next model on daily/rate quota
+
+                if resp.status_code in {404, 400}:
+                    last_error = RuntimeError(f"HTTP {resp.status_code} on '{model_name}': {resp.text[:180]}")
+                    logger.warning("Model '%s' returned HTTP %d — trying next model.", model_name, resp.status_code)
+                    break
+
+                if resp.status_code in {500, 502, 503, 504}:
+                    last_error = RuntimeError(f"HTTP {resp.status_code} on '{model_name}': {resp.text[:160]}")
+                    logger.warning(
+                        "Model '%s' temporary HTTP %d (%.1fs, try %d/%d).",
+                        model_name,
+                        resp.status_code,
+                        dt,
+                        attempt,
+                        retries_per_model,
+                    )
+                    if attempt < retries_per_model:
+                        time.sleep(2.5 * attempt)
+                    continue
+
+                resp.raise_for_status()
+                body = resp.json()
+                candidates = body.get("candidates") or []
+                if not candidates:
+                    raise ValueError(f"Empty Gemini candidates response: {str(body)[:200]}")
+
+                parts = candidates[0].get("content", {}).get("parts") or []
+                text = "".join(str(p.get("text", "")) for p in parts).strip()
+                data = extract_json_payload(text)
+                parsed = schema_cls.model_validate(data)
+                logger.info("Direct Gemini API '%s' succeeded in %.2fs.", model_name, dt)
+                return parsed
+
+            except requests.Timeout as exc:
+                last_error = TimeoutError(f"Direct Gemini API '{model_name}' timed out after {http_timeout[1]:.0f}s.")
+                logger.warning("%s (try %d/%d)", last_error, attempt, retries_per_model)
+                if attempt < retries_per_model:
+                    time.sleep(2.0)
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Direct Gemini API '%s' error (try %d/%d): %s", model_name, attempt, retries_per_model, exc)
+                if attempt < retries_per_model:
+                    time.sleep(2.0)
+
+    raise RuntimeError(
+        f"All direct Gemini API models failed ({', '.join(models)}): {last_error}"
+    ) from last_error
+
+
 async def _parse_agent_response(response, schema_cls: type[TModel]) -> TModel:
     """Resolve structured_output if present, otherwise parse JSON from response.text()."""
     try:
@@ -231,10 +345,24 @@ async def run_structured_agent_prompt(
     enable_web_search: bool = False,
     timeout_sec: float = LLM_CALL_TIMEOUT_SEC,
 ) -> TModel:
-    """Execute a single-turn Antigravity SDK prompt with strict timeout + automatic model fallback.
+    """Run structured Gemini generation fast & reliably.
 
-    Prevents infinite hangs when a free-tier model returns a multi-hour 429 retryDelay.
+    In headless CI (or when USE_DIRECT_GEMINI_API=true / GEMINI_API_KEY is set), calls the official
+    Google Gemini REST API directly with strict 30s timeouts and 2 retries—eliminating slow Go CLI
+    harness hangs and cutting daily quota usage in half.
     """
+    if USE_DIRECT_GEMINI_API or (GEMINI_API_KEY and not enable_web_search):
+        return await asyncio.to_thread(
+            _call_direct_gemini_rest,
+            system_instructions=system_instructions,
+            prompt=prompt,
+            schema_cls=schema_cls,
+            timeout_sec=timeout_sec,
+            retries_per_model=2,
+        )
+
+    from google.antigravity import Agent
+
     last_error: Exception | None = None
     models = get_model_chain()
 
@@ -260,9 +388,9 @@ async def run_structured_agent_prompt(
                 len(models),
             )
             return await asyncio.wait_for(_call_once(), timeout=timeout_sec)
-        except asyncio.TimeoutError as exc:
+        except asyncio.TimeoutError:
             last_error = TimeoutError(
-                f"Model '{model_name}' timed out after {timeout_sec:.0f}s (likely 429/503 retry wait)."
+                f"Model '{model_name}' timed out after {timeout_sec:.0f}s."
             )
             logger.warning("%s Trying fallback model if available...", last_error)
         except Exception as exc:
