@@ -1,0 +1,25 @@
+# Secrets & OAuth credentials (NEVER commit to Git)
+.env
+client_secret.json
+token.json
+
+# Rendered media, logs, and generated runtime assets
+output/
+uploaded/
+logs/
+assets/backgrounds/
+assets/fonts/
+assets/audio/
+*.mp4
+*.mov
+*.mp3
+*.wav
+*.tmp
+
+# Python environment & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
