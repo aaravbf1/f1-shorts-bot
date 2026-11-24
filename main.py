@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import socket
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from config import (
     SHORTS_PER_RUN,
     TTS_RATE,
     TTS_VOICE,
+    YOUTUBE_HTTP_TIMEOUT_SEC,
     YOUTUBE_PRIVACY_STATUS,
     ensure_directories,
 )
@@ -34,8 +36,14 @@ from youtube_uploader import (
 
 
 def setup_logging() -> Path:
-    """Configure console + daily file logging under logs/."""
+    """Configure unbuffered live console + daily file logging under logs/."""
     ensure_directories()
+    socket.setdefaulttimeout(YOUTUBE_HTTP_TIMEOUT_SEC)
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     log_file = LOGS_DIR / f"f1_shorts_{datetime.now().strftime('%Y-%m-%d')}.log"
     root = logging.getLogger()
     root.setLevel(logging.INFO)

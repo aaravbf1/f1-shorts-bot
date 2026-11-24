@@ -18,7 +18,7 @@ from config import (
     MAX_WORD_COUNT,
     MIN_WORD_COUNT,
 )
-from topic_engine import _parse_agent_response, build_antigravity_config
+from topic_engine import run_structured_agent_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -210,67 +210,63 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
         "Return ONLY valid JSON matching the schema."
     )
 
-    config = build_antigravity_config(
-        system_instructions=system_instructions,
-        enable_web_search=False,
-        response_schema=F1ShortScript,
-    )
-
     feedback_history: list[str] = []
-    async with Agent(config) as agent:
-        for attempt in range(1, max_attempts + 1):
-            retry_note = ""
-            if feedback_history:
-                retry_note = (
-                    "\n\nFIX THESE VALIDATION ERRORS FROM YOUR PREVIOUS DRAFT:\n"
-                    + "\n".join(f"- {err}" for err in feedback_history)
-                )
-
-            prompt = (
-                "Write the complete YouTube Short script, beat-by-beat visual storyboard, and metadata "
-                "for this verified Formula 1 topic:\n\n"
-                f"{json.dumps(topic, indent=2, ensure_ascii=False)}"
-                f"{retry_note}\n\n"
-                "Double-check that total spoken words across all beats is 118-138 words, "
-                "zero banned AI phrases appear anywhere, title is under 55 characters with #f1, "
-                "and the last sentence loops seamlessly back into the opening sentence."
+    for attempt in range(1, max_attempts + 1):
+        retry_note = ""
+        if feedback_history:
+            retry_note = (
+                "\n\nFIX THESE VALIDATION ERRORS FROM YOUR PREVIOUS DRAFT:\n"
+                + "\n".join(f"- {err}" for err in feedback_history)
             )
 
-            logger.info(
-                "Writing human-storyteller script via %s for '%s' (attempt %d/%d)...",
-                ANTIGRAVITY_MODEL,
-                topic["topic_slug"],
-                attempt,
-                max_attempts,
+        prompt = (
+            "Write the complete YouTube Short script, beat-by-beat visual storyboard, and metadata "
+            "for this verified Formula 1 topic:\n\n"
+            f"{json.dumps(topic, indent=2, ensure_ascii=False)}"
+            f"{retry_note}\n\n"
+            "Double-check that total spoken words across all beats is 130-142 words, "
+            "zero banned AI phrases appear anywhere, title is under 55 characters with #f1, "
+            "and the last sentence loops seamlessly back into the opening sentence."
+        )
+
+        logger.info(
+            "Writing human-storyteller script for '%s' (attempt %d/%d)...",
+            topic["topic_slug"],
+            attempt,
+            max_attempts,
+        )
+        script = await run_structured_agent_prompt(
+            system_instructions=system_instructions,
+            prompt=prompt,
+            schema_cls=F1ShortScript,
+            enable_web_search=False,
+        )
+
+        # Auto-sanitize harmless formatting edges before strict validation
+        script.title = normalize_title(script.title)
+        script.description = normalize_description(script.description)
+        script.tags = [t.strip().lstrip("#") for t in script.tags if t.strip()][:15]
+
+        errors = validate_script(script)
+        if not errors:
+            full_spoken = " ".join(b.spoken_text.strip() for b in script.beats)
+            payload = script.model_dump()
+            payload.update(
+                {
+                    "topic_slug": topic["topic_slug"],
+                    "category": topic["category"],
+                    "category_label": topic["category_label"],
+                    "angle": topic.get("angle", ""),
+                    "primary_team_color": topic.get("primary_team_color", "f1_red"),
+                    "secondary_team_color": topic.get("secondary_team_color", "gold"),
+                    "full_script": full_spoken,
+                    "word_count": count_words(full_spoken),
+                }
             )
-            response = await agent.chat(prompt)
-            script: F1ShortScript = await _parse_agent_response(response, F1ShortScript)  # type: ignore[assignment]
+            return payload
 
-            # Auto-sanitize harmless formatting edges before strict validation
-            script.title = normalize_title(script.title)
-            script.description = normalize_description(script.description)
-            script.tags = [t.strip().lstrip("#") for t in script.tags if t.strip()][:15]
-
-            errors = validate_script(script)
-            if not errors:
-                full_spoken = " ".join(b.spoken_text.strip() for b in script.beats)
-                payload = script.model_dump()
-                payload.update(
-                    {
-                        "topic_slug": topic["topic_slug"],
-                        "category": topic["category"],
-                        "category_label": topic["category_label"],
-                        "angle": topic.get("angle", ""),
-                        "primary_team_color": topic.get("primary_team_color", "f1_red"),
-                        "secondary_team_color": topic.get("secondary_team_color", "gold"),
-                        "full_script": full_spoken,
-                        "word_count": count_words(full_spoken),
-                    }
-                )
-                return payload
-
-            logger.warning("Script draft failed validation: %s", "; ".join(errors))
-            feedback_history = errors
+        logger.warning("Script draft failed validation: %s", "; ".join(errors))
+        feedback_history = errors
 
     raise RuntimeError(
         f"Script generation for '{topic['topic_slug']}' failed validation after {max_attempts} attempts: "

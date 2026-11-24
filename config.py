@@ -24,10 +24,22 @@ TOKEN_FILE = BASE_DIR / "token.json"
 
 # Antigravity SDK / Model configuration
 ANTIGRAVITY_MODEL = os.getenv("ANTIGRAVITY_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+ANTIGRAVITY_FALLBACK_MODELS = tuple(
+    m.strip()
+    for m in os.getenv("ANTIGRAVITY_FALLBACK_MODELS", "gemini-3.6-flash,gemini-3.5-flash").split(",")
+    if m.strip()
+)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 VERTEX_ENABLED = os.getenv("VERTEX_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "").strip()
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1").strip()
+
+# Strict runtime timeouts (prevent any hang in headless CI / GitHub Actions)
+LLM_CALL_TIMEOUT_SEC = float(os.getenv("LLM_CALL_TIMEOUT_SEC", "75"))
+HTTP_TIMEOUT_SEC = int(os.getenv("HTTP_TIMEOUT_SEC", "12"))
+TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "45"))
+FFMPEG_TIMEOUT_SEC = int(os.getenv("FFMPEG_TIMEOUT_SEC", "120"))
+YOUTUBE_HTTP_TIMEOUT_SEC = int(os.getenv("YOUTUBE_HTTP_TIMEOUT_SEC", "60"))
 
 # TTS configuration
 TTS_VOICE = os.getenv("TTS_VOICE", "en-GB-RyanNeural").strip()

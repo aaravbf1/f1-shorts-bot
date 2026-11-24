@@ -14,7 +14,7 @@ permissions:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -40,14 +40,18 @@ jobs:
 
       - name: Run F1 Shorts Engine
         env:
+          PYTHONUNBUFFERED: "1"
+          HEADLESS: "true"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
           TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
           PRIVACY_STATUS: public
           YOUTUBE_PRIVACY_STATUS: public
           ANTIGRAVITY_MODEL: gemini-4-hydrogen
+          ANTIGRAVITY_FALLBACK_MODELS: gemini-3.6-flash,gemini-3.5-flash
+          LLM_CALL_TIMEOUT_SEC: "75"
         run: |
-          python main.py
+          python -u main.py
 
       - name: Commit and push updated history.json
         if: always()

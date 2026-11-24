@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from asset_generator import ensure_all_assets
 from config import (
+    FFMPEG_TIMEOUT_SEC,
     MAX_HARD_DURATION_SEC,
     SAFE_BOTTOM,
     SAFE_LEFT,
@@ -28,6 +29,7 @@ from config import (
     TARGET_MAX_DURATION_SEC,
     TEAM_PALETTES,
     TTS_RATE,
+    TTS_TIMEOUT_SEC,
     TTS_VOICE,
     VIDEO_FPS,
     VIDEO_HEIGHT,
@@ -86,6 +88,7 @@ def get_audio_duration(path: Path, ffmpeg_bin: str) -> float:
             capture_output=True,
             text=True,
             check=True,
+            timeout=FFMPEG_TIMEOUT_SEC,
         )
         return float(proc.stdout.strip())
 
@@ -149,29 +152,37 @@ async def _synthesize_beat_tts(
     voice: str,
     rate: str,
 ) -> list[TimedWord]:
-    """Generate TTS audio with edge-tts and extract WordBoundary timestamps."""
+    """Generate TTS audio with edge-tts and extract WordBoundary timestamps with strict timeout."""
     kwargs: dict[str, Any] = {"voice": voice, "rate": rate}
     sig = inspect.signature(edge_tts.Communicate.__init__)
     if "boundary" in sig.parameters:
         kwargs["boundary"] = "WordBoundary"
 
-    communicator = edge_tts.Communicate(text, **kwargs)
-    words: list[TimedWord] = []
+    async def _run_tts() -> list[TimedWord]:
+        communicator = edge_tts.Communicate(text, **kwargs)
+        words: list[TimedWord] = []
+        with out_mp3.open("wb") as f:
+            async for chunk in communicator.stream():
+                ctype = chunk.get("type")
+                if ctype == "audio":
+                    f.write(chunk["data"])
+                elif ctype == "WordBoundary":
+                    w_text = str(chunk.get("text", "")).strip()
+                    if not w_text:
+                        continue
+                    offset_s = float(chunk.get("offset", 0)) / 10_000_000.0
+                    dur_s = max(0.05, float(chunk.get("duration", 0)) / 10_000_000.0)
+                    words.append(TimedWord(word=w_text, start=offset_s, end=offset_s + dur_s))
+        return words
 
-    with out_mp3.open("wb") as f:
-        async for chunk in communicator.stream():
-            ctype = chunk.get("type")
-            if ctype == "audio":
-                f.write(chunk["data"])
-            elif ctype == "WordBoundary":
-                w_text = str(chunk.get("text", "")).strip()
-                if not w_text:
-                    continue
-                offset_s = float(chunk.get("offset", 0)) / 10_000_000.0
-                dur_s = max(0.05, float(chunk.get("duration", 0)) / 10_000_000.0)
-                words.append(TimedWord(word=w_text, start=offset_s, end=offset_s + dur_s))
-
-    return words
+    last_err: Exception | None = None
+    for attempt in range(1, 3):
+        try:
+            return await asyncio.wait_for(_run_tts(), timeout=TTS_TIMEOUT_SEC)
+        except Exception as exc:
+            last_err = exc
+            logger.warning("edge-tts beat attempt %d/2 failed (%s); retrying...", attempt, exc)
+    raise RuntimeError(f"edge-tts failed after 2 attempts: {last_err}") from last_err
 
 
 def _trim_silence_ffmpeg(raw_audio: Path, trimmed_wav: Path, ffmpeg_bin: str) -> None:
@@ -194,7 +205,7 @@ def _trim_silence_ffmpeg(raw_audio: Path, trimmed_wav: Path, ffmpeg_bin: str) ->
         "1",
         str(trimmed_wav),
     ]
-    subprocess.run(cmd, capture_output=True, check=True)
+    subprocess.run(cmd, capture_output=True, check=True, timeout=FFMPEG_TIMEOUT_SEC)
 
 
 def _align_words_to_trimmed_duration(
@@ -271,6 +282,7 @@ async def _build_timed_voiceover(
                 [ffmpeg_bin, "-y", "-i", str(raw_mp3), "-ar", "44100", "-ac", "1", str(trimmed_wav)],
                 capture_output=True,
                 check=True,
+                timeout=FFMPEG_TIMEOUT_SEC,
             )
             dur = get_audio_duration(trimmed_wav, ffmpeg_bin)
 
@@ -317,6 +329,7 @@ async def _build_timed_voiceover(
         ],
         capture_output=True,
         check=True,
+        timeout=FFMPEG_TIMEOUT_SEC,
     )
 
     concat_list = work_dir / "concat.txt"
@@ -350,6 +363,7 @@ async def _build_timed_voiceover(
         ],
         capture_output=True,
         check=True,
+        timeout=FFMPEG_TIMEOUT_SEC,
     )
 
     total_duration = get_audio_duration(voice_wav, ffmpeg_bin)
@@ -380,6 +394,7 @@ async def _build_timed_voiceover(
             ],
             capture_output=True,
             check=True,
+            timeout=FFMPEG_TIMEOUT_SEC,
         )
         voice_wav = sped_wav
         new_duration = get_audio_duration(voice_wav, ffmpeg_bin)
@@ -451,7 +466,7 @@ def _mix_master_audio(
         "192k",
         str(output_audio),
     ]
-    subprocess.run(cmd, capture_output=True, check=True)
+    subprocess.run(cmd, capture_output=True, check=True, timeout=FFMPEG_TIMEOUT_SEC)
     return output_audio
 
 

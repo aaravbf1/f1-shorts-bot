@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import shutil
+import socket
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ from config import (
     TOKEN_FILE,
     UPLOADED_DIR,
     YOUTUBE_CATEGORY_ID,
+    YOUTUBE_HTTP_TIMEOUT_SEC,
     YOUTUBE_PRIVACY_STATUS,
     YOUTUBE_SCOPES,
 )
@@ -59,11 +62,22 @@ def materialize_credentials_from_env(
         logger.info("Materialized %s from TOKEN_JSON environment variable.", token_path.name)
 
 
+def _is_headless_environment() -> bool:
+    """Return True when running in GitHub Actions, CI, or a non-interactive headless shell."""
+    return (
+        os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+        or os.getenv("CI", "").lower() == "true"
+        or os.getenv("HEADLESS", "").lower() in {"1", "true", "yes"}
+        or not sys.stdin.isatty()
+    )
+
+
 def authenticate_youtube(
     client_secret_path: Path = CLIENT_SECRET_FILE,
     token_path: Path = TOKEN_FILE,
 ):
     """Authenticate via OAuth 2.0 and return an authorized YouTube Data API v3 service client."""
+    socket.setdefaulttimeout(YOUTUBE_HTTP_TIMEOUT_SEC)
     materialize_credentials_from_env(client_secret_path=client_secret_path, token_path=token_path)
     creds: Credentials | None = None
 
@@ -75,10 +89,10 @@ def authenticate_youtube(
             logger.info("Refreshing expired YouTube OAuth token...")
             creds.refresh(Request())
         else:
-            if os.getenv("GITHUB_ACTIONS", "").lower() == "true" or os.getenv("CI", "").lower() == "true":
+            if _is_headless_environment():
                 raise RuntimeError(
-                    "No valid YouTube OAuth token available in CI environment. "
-                    "Ensure the TOKEN_JSON GitHub Secret contains a valid token.json with a refresh_token."
+                    "Refusing to launch interactive OAuth run_local_server() in headless/cloud mode. "
+                    "Ensure the TOKEN_JSON secret contains a valid token.json with a refresh_token."
                 )
             if not client_secret_path.exists():
                 raise FileNotFoundError(
@@ -93,13 +107,13 @@ def authenticate_youtube(
         token_path.write_text(creds.to_json(), encoding="utf-8")
         logger.info("Saved YouTube OAuth token to %s", token_path.name)
 
-    return build("youtube", "v3", credentials=creds)
+    return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 
 def verify_connected_channel(youtube) -> ConnectedChannel:
     """Query channels().list(part='snippet', mine=True) and print/log exact target channel."""
     try:
-        response = youtube.channels().list(part="snippet", mine=True).execute()
+        response = youtube.channels().list(part="snippet", mine=True).execute(num_retries=2)
     except HttpError as err:
         _check_quota_error(err)
         raise
@@ -116,9 +130,9 @@ def verify_connected_channel(youtube) -> ConnectedChannel:
     channel_title = channel.get("snippet", {}).get("title", "<Unknown Channel>")
 
     banner = f"Connected YouTube Channel: {channel_title} (Channel ID: {channel_id})"
-    print("=" * len(banner))
-    print(banner)
-    print("=" * len(banner))
+    print("=" * len(banner), flush=True)
+    print(banner, flush=True)
+    print("=" * len(banner), flush=True)
     logger.info(banner)
     return ConnectedChannel(channel_id=channel_id, channel_title=channel_title)
 
@@ -198,7 +212,7 @@ def upload_short(
     response = None
     try:
         while response is None:
-            status, response = request.next_chunk()
+            status, response = request.next_chunk(num_retries=2)
             if status:
                 logger.info("Upload progress for %s: %d%%", video_path.name, int(status.progress() * 100))
     except HttpError as err:
@@ -207,7 +221,7 @@ def upload_short(
 
     video_id = response["id"]
     logger.info("Upload succeeded! Video ID: %s | URL: https://youtube.com/shorts/%s", video_id, video_id)
-    print(f"Uploaded Short: {title} -> https://youtube.com/shorts/{video_id} (privacy={privacy_status})")
+    print(f"Uploaded Short: {title} -> https://youtube.com/shorts/{video_id} (privacy={privacy_status})", flush=True)
 
     # Record permanently in history.json
     history_store.record_upload(
