@@ -43,8 +43,10 @@ jobs:
           TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
           PRIVACY_STATUS: public
           YOUTUBE_PRIVACY_STATUS: public
-          TTS_RATE: "-10%"
-          INTER_BEAT_GAP_SEC: "0.35"
+          TTS_VOICE: "en-US-AndrewMultilingualNeural"
+          TTS_RATE: "-6%"
+          TTS_PITCH: "+0Hz"
+          INTER_BEAT_GAP_SEC: "0.25"
           LLM_CALL_TIMEOUT_SEC: "30"
           HTTP_TIMEOUT_SEC: "15"
         run: |

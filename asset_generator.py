@@ -688,27 +688,44 @@ def _write_wav_mono(path: Path, samples: list[float], sample_rate: int = 44100) 
 
 
 def _generate_bgm_bed(path: Path, duration_sec: float = 64.0, sr: int = 22050) -> Path:
-    """Synthesize a clean, subtle dark-electronic racing tension pulse bed (royalty-free)."""
+    """Synthesize a smooth, subtle cinematic/electronic F1 ambient synth & bass pulse bed (100% offline CC0)."""
     total = int(duration_sec * sr)
     samples: list[float] = [0.0] * total
-    bpm = 124.0
+    bpm = 118.0
     beat_sec = 60.0 / bpm
-    roots = [73.42, 58.27, 65.41, 55.00]
+    # Cinematic F1 dark minor progression: D minor -> Bb -> F -> C
+    roots = [73.42, 58.27, 87.31, 65.41]
+    prev_lp = 0.0
     for i in range(total):
         t = i / sr
         bar_idx = int(t / (beat_sec * 4)) % len(roots)
         root = roots[bar_idx]
-        beat_phase = (t % beat_sec) / beat_sec
-        pulse_env = math.exp(-beat_phase * 4.5) * 0.55 + 0.45
-        sub = math.sin(2 * math.pi * root * t) * 0.30 * pulse_env
+
+        # Smooth rolling analog-style bass pulse (warm low end, zero harsh clicks)
+        eighth_phase = (t % (beat_sec / 2.0)) / (beat_sec / 2.0)
+        bass_env = 0.55 + 0.45 * math.exp(-eighth_phase * 3.8)
+        sub_bass = (
+            math.sin(2 * math.pi * root * t) * 0.34
+            + math.sin(2 * math.pi * (root * 2.0) * t) * 0.14
+        ) * bass_env
+
+        # Lush cinematic ambient chord pad (root + minor third + fifth, gently breathing)
+        swell = 0.72 + 0.28 * math.sin(2 * math.pi * 0.18 * t)
         pad = (
-            math.sin(2 * math.pi * (root * 2.0) * t) * 0.14
-            + math.sin(2 * math.pi * (root * 3.0) * t) * 0.08
-        ) * (0.7 + 0.3 * math.sin(2 * math.pi * 0.25 * t))
-        sixteenth = (t % (beat_sec / 4.0)) / (beat_sec / 4.0)
-        tick = math.sin(2 * math.pi * 880.0 * t) * math.exp(-sixteenth * 28.0) * 0.045
-        fade = min(1.0, t / 0.8) * min(1.0, max(0.0, (duration_sec - t) / 1.0))
-        samples[i] = (sub + pad + tick) * fade * 0.65
+            math.sin(2 * math.pi * (root * 2.0) * t + 0.3) * 0.12
+            + math.sin(2 * math.pi * (root * 2.378) * t) * 0.08
+            + math.sin(2 * math.pi * (root * 3.0) * t) * 0.10
+            + math.sin(2 * math.pi * (root * 4.0) * t) * 0.04
+        ) * swell
+
+        # Gentle 1-pole low-pass filter so frequencies stay warm underneath vocal clarity
+        raw = (sub_bass + pad) * 0.78
+        prev_lp = prev_lp + 0.18 * (raw - prev_lp)
+
+        # Clean loop edges
+        fade = min(1.0, t / 0.5) * min(1.0, max(0.0, (duration_sec - t) / 0.8))
+        samples[i] = prev_lp * fade
+
     return _write_wav_mono(path, samples, sample_rate=sr)
 
 
@@ -745,14 +762,14 @@ def _generate_pop_sfx(path: Path, duration_sec: float = 0.14, sr: int = 22050) -
 
 
 def ensure_audio_assets() -> dict[str, Path]:
-    """Ensure subtle background music bed and whoosh/pop transition SFX exist."""
+    """Ensure subtle v3 cinematic ambient F1 background music bed and whoosh/pop transition SFX exist."""
     ensure_directories()
-    bgm_path = AUDIO_DIR / "f1_dark_pulse_bgm.wav"
+    bgm_path = AUDIO_DIR / "f1_ambient_v3_bgm.wav"
     whoosh_path = AUDIO_DIR / "sfx_whoosh.wav"
     pop_path = AUDIO_DIR / "sfx_pop.wav"
 
     if not bgm_path.exists():
-        logger.info("Generating royalty-free F1 background music bed...")
+        logger.info("Generating offline Shorts v3 cinematic F1 ambient background music bed...")
         _generate_bgm_bed(bgm_path)
     if not whoosh_path.exists():
         _generate_whoosh_sfx(whoosh_path)

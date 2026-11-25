@@ -16,6 +16,7 @@ from config import (
     LOGS_DIR,
     OUTPUT_DIR,
     SHORTS_PER_RUN,
+    TTS_PITCH,
     TTS_RATE,
     TTS_VOICE,
     YOUTUBE_HTTP_TIMEOUT_SEC,
@@ -85,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         "--voice",
         type=str,
         default=TTS_VOICE,
-        help=f"edge-tts voice name (default: {TTS_VOICE}; options: en-GB-RyanNeural, en-US-AndrewNeural).",
+        help=f"edge-tts voice name (default: {TTS_VOICE}; options: en-US-AndrewMultilingualNeural, en-US-BrianMultilingualNeural).",
     )
     parser.add_argument(
         "--privacy",
@@ -99,6 +100,7 @@ def parse_args() -> argparse.Namespace:
 
 def run_pipeline(args: argparse.Namespace) -> int:
     logger = logging.getLogger("main")
+    logger.info("[Shorts v3] Pipeline initialized")
     ensure_directories()
     materialize_credentials_from_env()
     ensure_all_assets()
@@ -205,6 +207,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             output_mp4=video_path,
             voice=args.voice,
             rate=TTS_RATE,
+            pitch=TTS_PITCH,
             thumbnail_path=thumb_path,
         )
 

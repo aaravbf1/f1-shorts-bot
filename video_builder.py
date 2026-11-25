@@ -38,6 +38,7 @@ from config import (
     TARGET_MAX_DURATION_SEC,
     TEAM_PALETTES,
     THUMBNAIL_FLASH_SEC,
+    TTS_PITCH,
     TTS_RATE,
     TTS_TIMEOUT_SEC,
     TTS_VOICE,
@@ -158,9 +159,10 @@ async def _synthesize_beat_tts(
     out_mp3: Path,
     voice: str,
     rate: str,
+    pitch: str = TTS_PITCH,
 ) -> list[TimedWord]:
-    """Generate TTS audio with edge-tts and extract WordBoundary timestamps with strict timeout."""
-    kwargs: dict[str, Any] = {"voice": voice, "rate": rate}
+    """Generate TTS audio with edge-tts (multilingual neural narrator) and extract WordBoundary timestamps."""
+    kwargs: dict[str, Any] = {"voice": voice, "rate": rate, "pitch": pitch}
     sig = inspect.signature(edge_tts.Communicate.__init__)
     if "boundary" in sig.parameters:
         kwargs["boundary"] = "WordBoundary"
@@ -256,8 +258,9 @@ async def _build_timed_voiceover(
     ffmpeg_bin: str,
     voice: str = TTS_VOICE,
     rate: str = TTS_RATE,
+    pitch: str = TTS_PITCH,
 ) -> tuple[Path, list[TimedBeat], list[TimedWord], float]:
-    """Synthesize beat-by-beat narration (-10% pace, 0.35s breathing pauses, 0.15s thumbnail flash)."""
+    """Synthesize beat-by-beat narration (-6% pace, +0Hz pitch, 0.25s breath pauses, -14 LUFS)."""
     beats_raw = script_data.get("beats", [])
     if not beats_raw:
         raise ValueError("Script has no visual beats to render.")
@@ -268,7 +271,7 @@ async def _build_timed_voiceover(
     timed_beats: list[TimedBeat] = []
     beat_wavs: list[Path] = []
     lead_in_sec = THUMBNAIL_FLASH_SEC  # 0.15s dedicated thumbnail hook frame at t=0
-    inter_beat_gap = INTER_BEAT_GAP_SEC  # 0.35s breathing pause between 1-sentence beats
+    inter_beat_gap = INTER_BEAT_GAP_SEC  # 0.25s natural breath pause between 1-sentence beats
     cursor = lead_in_sec
 
     for idx, beat in enumerate(beats_raw):
@@ -279,7 +282,7 @@ async def _build_timed_voiceover(
         raw_mp3 = work_dir / f"beat_{idx:02d}_raw.mp3"
         trimmed_wav = work_dir / f"beat_{idx:02d}_trim.wav"
 
-        raw_words = await _synthesize_beat_tts(spoken, raw_mp3, voice=voice, rate=rate)
+        raw_words = await _synthesize_beat_tts(spoken, raw_mp3, voice=voice, rate=rate, pitch=pitch)
         _trim_silence_ffmpeg(raw_mp3, trimmed_wav, ffmpeg_bin)
         dur = get_audio_duration(trimmed_wav, ffmpeg_bin)
 
@@ -451,13 +454,17 @@ def _mix_master_audio(
     output_audio: Path,
     ffmpeg_bin: str,
 ) -> Path:
-    """Mix normalized narration, -22 dB BGM bed, and crisp pop/whoosh SFX on badge & photo transitions."""
+    """Mix -14 LUFS narration, subtle -23 dB ambient BGM (0.5s fade-in, 1.0s fade-out), and transition SFX."""
+    fade_out_start = max(0.0, total_duration - 1.0)
     inputs = ["-i", str(voice_wav), "-stream_loop", "-1", "-i", str(bgm_path)]
     filter_parts = [
         "[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=1.0[vo]",
         (
             f"[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
-            f"atrim=0:{total_duration:.3f},volume=-22dB[bgm]"
+            f"atrim=0:{total_duration:.3f},"
+            f"afade=t=in:st=0:d=0.5,"
+            f"afade=t=out:st={fade_out_start:.3f}:d=1.0,"
+            f"volume=-23dB[bgm]"
         ),
     ]
     mix_labels = ["[vo]", "[bgm]"]
@@ -906,6 +913,7 @@ def build_short_video(
     *,
     voice: str = TTS_VOICE,
     rate: str = TTS_RATE,
+    pitch: str = TTS_PITCH,
     thumbnail_path: Path | None = None,
 ) -> dict[str, Any]:
     """Render a complete 9:16 1080x1920 30fps H.264 YouTube Short (< 60s) + custom high-click thumbnail."""
@@ -943,13 +951,14 @@ def build_short_video(
         work_dir = Path(tmp)
 
         logger.info(
-            "Synthesizing slower, clearer voiceover (%s, rate=%s, pause=%.2fs)...",
+            "Synthesizing Shorts v3 voiceover (%s, rate=%s, pitch=%s, pause=%.2fs, -14 LUFS)...",
             voice,
             rate,
+            pitch,
             INTER_BEAT_GAP_SEC,
         )
         voice_wav, timed_beats, all_words, total_duration = asyncio.run(
-            _build_timed_voiceover(script_data, work_dir, ffmpeg_bin, voice=voice, rate=rate)
+            _build_timed_voiceover(script_data, work_dir, ffmpeg_bin, voice=voice, rate=rate, pitch=pitch)
         )
 
         if total_duration >= 60.0:
@@ -959,7 +968,7 @@ def build_short_video(
         photo_shots = _build_photo_shots(timed_beats, beat_photo_paths, total_duration)
         logger.info("Prepared %d full-bleed real F1 photo shots with Ken Burns motion.", len(photo_shots))
 
-        logger.info("Mixing voiceover + -22 dB BGM + pop/whoosh SFX (duration=%.2fs)...", total_duration)
+        logger.info("Mixing -14 LUFS voiceover + -23 dB ambient BGM (0.5s in / 1.0s out) + SFX (duration=%.2fs)...", total_duration)
         master_audio_path = work_dir / "master_audio.m4a"
         _mix_master_audio(
             voice_wav=voice_wav,
@@ -1066,13 +1075,7 @@ def build_short_video(
                     frame.paste(sub_rgb, (0, sub_y0), sub_a)
                     break
 
-            # Sleek top retention progress bar (y=172) drawn directly on RGB
-            pdraw = ImageDraw.Draw(frame)
-            bar_x0, bar_x1, bar_y = SAFE_LEFT, SAFE_RIGHT, 172
-            pdraw.rounded_rectangle([bar_x0, bar_y, bar_x1, bar_y + 8], radius=4, fill=(70, 74, 84))
-            fill_x = bar_x0 + int((bar_x1 - bar_x0) * progress)
-            pdraw.rounded_rectangle([bar_x0, bar_y, max(bar_x0 + 8, fill_x), bar_y + 8], radius=4, fill=accent_rgb)
-
+            # Shorts v3: top progress/status bar removed so viewers stay hooked through the loop
             return np.asarray(frame)
 
         render_t0 = time.monotonic()
