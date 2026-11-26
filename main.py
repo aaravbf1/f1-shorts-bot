@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
 
 def run_pipeline(args: argparse.Namespace) -> int:
     logger = logging.getLogger("main")
-    logger.info("[Shorts v3] Pipeline initialized")
+    logger.info("[Shorts v4] Pipeline initialized")
     ensure_directories()
     materialize_credentials_from_env()
     ensure_all_assets()
@@ -189,12 +189,27 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 "angle": script_data.get("angle", ""),
             }
         )
+        scenes_list = script_data.get("scenes") or script_data.get("beats") or []
         logger.info(
-            "Validated unique script: '%s' (%d words, %d beats)",
+            "Validated unique Shorts v4 storyboard: '%s' (%d words, %d scenes)",
             script_data["title"],
             script_data["word_count"],
-            len(script_data["beats"]),
+            len(scenes_list),
         )
+        for s_idx, sc in enumerate(scenes_list, start=1):
+            nar = sc.get("narration") or sc.get("spoken_text") or ""
+            vq = sc.get("visual_query") or sc.get("photo_query") or ""
+            fq = sc.get("fallback_query") or ""
+            sb = sc.get("stat_badge") or sc.get("callout_badge") or ""
+            logger.info(
+                "  Scene %d/%d | visual_query=%r | fallback=%r | badge=%r | narration=%r",
+                s_idx,
+                len(scenes_list),
+                vq,
+                fq,
+                sb,
+                nar,
+            )
 
         # 5. Render strict 9:16 1080x1920 30fps MP4 (< 60s) + custom high-click thumbnail
         base_name = f"{run_stamp}_{idx}_{slug[:42]}"
@@ -222,18 +237,36 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
         if args.dry_run:
             print(
-                f"\n[DRY-RUN Short {idx}/{len(topics)}]\n"
+                f"\n[DRY-RUN Shorts v4 ({idx}/{len(topics)})]\n"
                 f"  Category  : {script_data['category_label']}\n"
                 f"  Title     : {script_data['title']} ({len(script_data['title'])} chars)\n"
                 f"  Thumb Hook: {script_data.get('thumbnail_hook', '')}\n"
                 f"  Duration  : {render_info['duration_sec']}s ({render_info['width']}x{render_info['height']} @ {render_info['fps']}fps)\n"
-                f"  Photos    : {render_info.get('photo_shot_count', 0)} full-bleed real F1 shots\n"
+                f"  Scenes    : {render_info.get('beat_count', len(scenes_list))} narration-locked scenes ({render_info.get('photo_shot_count', 0)} unique real F1 photos)\n"
                 f"  Words     : {script_data['word_count']}\n"
                 f"  Video     : {video_path}\n"
                 f"  Thumbnail : {thumb_path}\n"
                 f"  Metadata  : {meta_path}\n",
                 flush=True,
             )
+            print("  --- Scene-by-Scene Narration & Matched Visuals ---", flush=True)
+            for s_idx, sc in enumerate(scenes_list, start=1):
+                nar = sc.get("narration") or sc.get("spoken_text") or ""
+                vq = sc.get("visual_query") or sc.get("photo_query") or ""
+                fq = sc.get("fallback_query") or ""
+                sb = sc.get("stat_badge") or sc.get("callout_badge") or ""
+                sm: dict[str, Any] = {}
+                match_src = ""
+                if s_idx - 1 < len(render_info.get("scene_matches", [])):
+                    sm = render_info["scene_matches"][s_idx - 1]
+                    match_src = f" [{sm.get('matched_via', '')}: {sm.get('image_title', '')[:48]}]"
+                print(
+                    f"  Scene {s_idx:02d} ({sm.get('duration_sec', 0):.2f}s){match_src}\n"
+                    f"    Narration   : {nar}\n"
+                    f"    Visual Query: {vq} (fallback: {fq})\n"
+                    f"    Stat Badge  : {sb or '(none)'}",
+                    flush=True,
+                )
             results.append(
                 {
                     "status": "dry_run",

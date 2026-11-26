@@ -1,4 +1,4 @@
-"""Casual-Friendly Human Storyteller & Seamless-Loop Shorts Scriptwriter with strict anti-AI & anti-jargon validation."""
+"""Shorts v4 Scene-by-Scene Visual Storyboard Scriptwriter with strict anti-AI & anti-jargon validation."""
 
 from __future__ import annotations
 
@@ -22,63 +22,61 @@ from topic_engine import run_structured_agent_prompt
 logger = logging.getLogger(__name__)
 
 
-class VisualBeat(BaseModel):
-    """A single punchy 1-sentence narration + matched real F1 photo + mid-video callout beat."""
+class SceneBeat(BaseModel):
+    """A single narration-locked visual scene (~3-5 seconds, 1-2 sentences) with exact photo queries."""
 
-    spoken_text: str = Field(
-        description="ONE crisp, casual-friendly spoken sentence (9-15 everyday words, zero engineer jargon)."
-    )
-    photo_query: str = Field(
+    narration: str = Field(
         description=(
-            "Specific Wikimedia Commons / Wikipedia F1 photograph search query for this exact beat's "
-            "driver, car, track, or race moment (e.g. 'Max Verstappen Red Bull Formula 1', "
-            "'Ferrari F1 pit stop', 'Monaco Grand Prix Formula 1', 'Lewis Hamilton Mercedes F1')."
+            "Exact spoken narration lines for this scene (1-2 crisp, casual-friendly sentences, "
+            "~10-18 everyday words, ~3-5 seconds spoken, zero unexplained engineering jargon)."
         )
     )
-    secondary_photo_query: str = Field(
-        default="",
+    visual_query: str = Field(
         description=(
-            "Optional second distinct F1 photo search query for a fast 2.5-3.5s visual cut mid-beat "
-            "(e.g. 'Formula 1 cockpit steering wheel', 'Silverstone Grand Prix F1 race')."
-        ),
+            "Highly specific real-photograph search query matching the EXACT subject, setting, and "
+            "race/event mentioned in this scene's narration (e.g. 'Max Verstappen post race interview "
+            "press conference Las Vegas F1', 'Ferrari F1 pit stop crew mechanics race', "
+            "'Lewis Hamilton Fernando Alonso McLaren 2007 Formula 1')."
+        )
     )
-    callout_badge: str = Field(
+    fallback_query: str = Field(
+        description=(
+            "Slightly broader, still context-accurate real-photo F1 query for the same driver, team, "
+            "or setting used if visual_query returns fewer than 2 valid high-res photos "
+            "(e.g. 'Max Verstappen Red Bull Formula 1', 'Ferrari F1 pit stop')."
+        )
+    )
+    stat_badge: str = Field(
         default="",
         description=(
-            "Punchy 2-4 word mid-video stat/detail pop-up badge (e.g. '350+ KM/H', '5G BRAKING', "
-            "'1.8s PIT STOP', '$100M FINE', 'ONLY 6 CARS'). Leave blank only on beats without a highlight stat."
+            "Optional short 2-4 word on-screen callout badge ONLY when this scene mentions a concrete "
+            "stat, quote, year, or lap number (e.g. '350+ KM/H', 'LAP 58', '1.80s STOP', '$100M FINE'). "
+            "Leave empty string '' if no concrete stat/quote/lap is mentioned."
         ),
     )
     card_type: Literal["story_card", "quote_callout", "big_stat", "driver_vs_driver"] = Field(
         default="story_card",
-        description="Overlay emphasis style for this beat.",
+        description="Overlay emphasis style for this scene.",
     )
     card_header: str = Field(
-        description="Short bold 2-5 word on-screen visual kicker or quote."
-    )
-    card_subtext: str = Field(
         default="",
-        description="Short 3-8 word detail or context.",
-    )
-    stat_value: str = Field(
-        default="",
-        description="Single huge number/metric if applicable (e.g. '350 KM/H', '5G', '1.8s').",
+        description="Short bold 2-5 word sub-label or quote line when stat_badge/quote is shown.",
     )
     stat_label: str = Field(
         default="",
-        description="2-4 word label for stat_value.",
+        description="Optional 2-4 word label under stat_badge.",
     )
     left_label: str = Field(
         default="",
-        description="Left driver/team for driver_vs_driver beat.",
+        description="Left driver/team label when card_type=='driver_vs_driver'.",
     )
     right_label: str = Field(
         default="",
-        description="Right driver/team for driver_vs_driver beat.",
+        description="Right driver/team label when card_type=='driver_vs_driver'.",
     )
     quote_speaker: str = Field(
         default="",
-        description="Speaker name for quote_callout beat.",
+        description="Speaker name when card_type=='quote_callout'.",
     )
     accent_color: str = Field(
         default="",
@@ -87,7 +85,7 @@ class VisualBeat(BaseModel):
 
 
 class F1ShortScript(BaseModel):
-    """Complete casual-friendly F1 Short script, visual photo plan, thumbnail hook, and metadata."""
+    """Complete Shorts v4 scene-by-scene storyboard, visual photo plan, thumbnail hook, and metadata."""
 
     title: str = Field(
         description="Clickable curiosity-gap YouTube Shorts title strictly under 60 characters, ending with #shorts."
@@ -96,10 +94,10 @@ class F1ShortScript(BaseModel):
         description="Bold, punchy 3-4 word high-click thumbnail hook text in ALL CAPS (e.g. 'ONLY 6 CARS!', '$100M PHOTOCOPY', '350 KM/H CHAOS')."
     )
     hero_photo_query: str = Field(
-        description="Best dramatic Wikimedia Commons F1 action photo search query for the main thumbnail."
+        description="Most dramatic, specific Wikimedia Commons F1 action photo query for the main thumbnail."
     )
     description: str = Field(
-        description="2-sentence casual hook summary followed by #f1 #shorts #formula1 and 2-3 relevant topic hashtags."
+        description="SEO-rich 2-sentence casual hook summary followed by #f1 #shorts #formula1 and 2-3 relevant topic hashtags."
     )
     tags: list[str] = Field(
         min_length=12,
@@ -110,12 +108,12 @@ class F1ShortScript(BaseModel):
         description="Short spicy comment-bait debate question shown on-screen at the end (<= 9 words)."
     )
     loop_explanation: str = Field(
-        description="Brief check showing how the final spoken sentence flows directly into Beat 0's opening hook."
+        description="Brief check showing how the final scene's closing narration flows directly into Scene 0's opening hook."
     )
-    beats: list[VisualBeat] = Field(
-        min_length=8,
+    scenes: list[SceneBeat] = Field(
+        min_length=6,
         max_length=10,
-        description="8-10 punchy 1-sentence beats totaling 95-128 spoken words.",
+        description="Ordered list of 6-10 short narration-matched visual scenes (~3-5s each, totaling 95-135 spoken words).",
     )
 
 
@@ -134,12 +132,12 @@ def find_banned_phrases(text: str) -> list[str]:
     return hits
 
 
-def find_unexplained_jargon(beats: list[VisualBeat]) -> list[str]:
+def find_unexplained_jargon(scenes: list[SceneBeat]) -> list[str]:
     """Detect banned engineering jargon unless immediately translated into everyday language."""
     translation_cues = ("like a ", "like ", "basically ", "meaning ", "which feels ", "imagine ")
     hits: list[str] = []
-    for beat in beats:
-        lowered = beat.spoken_text.lower()
+    for scene in scenes:
+        lowered = scene.narration.lower()
         for term in BANNED_JARGON_TERMS:
             pattern = r"\b" + re.escape(term.lower()) + r"\b"
             if re.search(pattern, lowered):
@@ -151,7 +149,6 @@ def find_unexplained_jargon(beats: list[VisualBeat]) -> list[str]:
 def normalize_title(title: str) -> str:
     """Ensure title is strictly under 60 characters and ends cleanly with #shorts."""
     clean = " ".join(title.strip().split())
-    # Strip any existing trailing/inline #shorts or #f1 so we end cleanly with #shorts
     base = re.sub(r"\s*#shorts\b", "", clean, flags=re.IGNORECASE).strip(" -:|,")
     base = re.sub(r"\s*#f1\b", "", base, flags=re.IGNORECASE).strip(" -:|,")
     suffix = " #shorts"
@@ -181,50 +178,54 @@ def normalize_description(description: str) -> str:
 
 
 def validate_script(script: F1ShortScript) -> list[str]:
-    """Enforce casual-friendly storytelling, zero unexplained jargon, pacing, and metadata rules."""
+    """Enforce scene-by-scene narration/visual alignment, casual storytelling, pacing, and metadata rules."""
     errors: list[str] = []
 
-    if not (8 <= len(script.beats) <= 10):
-        errors.append(f"Script must have 8-10 punchy 1-sentence beats (got {len(script.beats)}).")
+    if not (6 <= len(script.scenes) <= 10):
+        errors.append(f"Script must have 6-10 scenes (got {len(script.scenes)}).")
 
-    full_spoken = " ".join(b.spoken_text.strip() for b in script.beats)
+    full_spoken = " ".join(s.narration.strip() for s in script.scenes)
     words = count_words(full_spoken)
+    max_words_v4 = max(MAX_WORD_COUNT, 135)
     if words < MIN_WORD_COUNT:
-        errors.append(f"Spoken script too short ({words} words; must be {MIN_WORD_COUNT}-{MAX_WORD_COUNT}).")
-    elif words > MAX_WORD_COUNT:
-        errors.append(f"Spoken script too long ({words} words; must be {MIN_WORD_COUNT}-{MAX_WORD_COUNT}).")
+        errors.append(f"Spoken script too short ({words} words; must be {MIN_WORD_COUNT}-{max_words_v4}).")
+    elif words > max_words_v4:
+        errors.append(f"Spoken script too long ({words} words; must be {MIN_WORD_COUNT}-{max_words_v4}).")
 
-    # Check banned AI clichés across title, description, and narration
     combined_text = f"{script.title}\n{script.description}\n{full_spoken}"
     banned_hits = find_banned_phrases(combined_text)
     if banned_hits:
         errors.append(f"Banned AI clichés detected: {', '.join(banned_hits)}")
 
-    # Check unexplained engineering jargon
-    jargon_hits = find_unexplained_jargon(script.beats)
+    jargon_hits = find_unexplained_jargon(script.scenes)
     if jargon_hits:
         errors.append(
             f"Unexplained technical jargon detected ({', '.join(jargon_hits)}). "
             "Remove it or translate it immediately into a vivid everyday comparison."
         )
 
-    # Check Beat 0 hook is punchy and not a greeting
-    first_beat = script.beats[0].spoken_text.strip()
-    if count_words(first_beat) > 18:
-        errors.append(f"Opening hook beat is too long ({count_words(first_beat)} words; keep <= 17 words).")
-    if re.match(r"^(hey|hello|hi|welcome|today we|in this)", first_beat.lower()):
-        errors.append("Opening hook must start mid-action or with a shocking fact — never a greeting.")
+    # Check Scene 0 hook (0-2s curiosity-gap opener)
+    first_scene = script.scenes[0].narration.strip()
+    if count_words(first_scene) > 20:
+        errors.append(f"Opening hook scene is too long ({count_words(first_scene)} words; keep <= 18 words).")
+    if re.match(r"^(hey|hello|hi|welcome|today we|in this)", first_scene.lower()):
+        errors.append("Opening hook must start mid-action or with a curiosity gap — never a greeting.")
 
-    # Check every beat has a concrete real F1 photo query and enough mid-video pop-up badges
-    missing_photos = [i for i, b in enumerate(script.beats) if len(b.photo_query.strip()) < 4]
-    if missing_photos:
-        errors.append(f"Beats missing real F1 photo_query: {missing_photos}")
-
-    badge_count = sum(1 for b in script.beats if b.callout_badge.strip() or b.stat_value.strip())
-    if badge_count < 4:
+    # Check every scene has a specific visual_query AND a broader fallback_query
+    weak_visual = [i for i, s in enumerate(script.scenes) if len(s.visual_query.strip().split()) < 3]
+    if weak_visual:
         errors.append(
-            f"Include at least 4 mid-video stat/detail pop-up badges across beats (found {badge_count})."
+            f"Scenes with overly vague visual_query (<3 words): {weak_visual}. "
+            "Include specific driver/team, action/setting, and track/event."
         )
+    weak_fallback = [i for i, s in enumerate(script.scenes) if len(s.fallback_query.strip().split()) < 2]
+    if weak_fallback:
+        errors.append(f"Scenes missing context-accurate fallback_query: {weak_fallback}.")
+
+    # Ensure visual_query values aren't copy-pasted across scenes
+    unique_queries = {s.visual_query.strip().lower() for s in script.scenes}
+    if len(unique_queries) < max(4, len(script.scenes) - 1):
+        errors.append("Each scene must have a distinct visual_query matching that exact scene's narration.")
 
     # Check title length (< 60 chars) & #shorts ending
     if len(script.title.strip()) >= 60:
@@ -232,25 +233,23 @@ def validate_script(script: F1ShortScript) -> list[str]:
     if not script.title.strip().lower().endswith("#shorts"):
         errors.append("Title must end with '#shorts'.")
 
-    # Check tag count
     clean_tags = [t.strip().lstrip("#") for t in script.tags if t.strip()]
     if not (12 <= len(clean_tags) <= 15):
         errors.append(f"Expected 12-15 tags, got {len(clean_tags)}.")
 
-    # Check seamless loop ending doesn't end with dead sign-off language
-    last_beat = script.beats[-1].spoken_text.strip().lower()
+    last_scene = script.scenes[-1].narration.strip().lower()
     for bad_end in ("subscribe", "like and follow", "thanks for watching", "see you next time"):
-        if bad_end in last_beat:
-            errors.append(f"Final beat contains non-loop sign-off ('{bad_end}'); end with a seamless loop bridge.")
+        if bad_end in last_scene:
+            errors.append(f"Final scene contains non-loop sign-off ('{bad_end}'); end with a seamless loop bridge.")
 
     return errors
 
 
 async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int = 3) -> dict[str, Any]:
-    """Generate and validate a casual-friendly, real-photo storyboarded F1 Short script."""
+    """Generate and validate a Shorts v4 scene-by-scene narration-matched visual storyboard."""
     system_instructions = (
-        "You are a charismatic, everyday Formula 1 storyteller writing viral 45-to-54-second YouTube Shorts "
-        "for casual F1 fans and non-engineers.\n\n"
+        "You are a charismatic, everyday Formula 1 storyteller and visual director writing viral "
+        "44-to-54-second YouTube Shorts (Shorts v4) for casual F1 fans.\n\n"
         "CASUAL-FRIENDLY VOICE RULES:\n"
         "1. ZERO NERD JARGON: Never use unexplained engineering terms like CFD, venturi tunnels, bargeboards, "
         "porpoising, telemetry, brake migration, differential maps, or aero efficiency. If you touch a physical "
@@ -258,26 +257,33 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
         "jackhammer at 320 km/h', 'braking so hard it feels like five people sitting on your chest', "
         "'changing four tires faster than you can blink twice').\n"
         "2. HUMAN STAKES FIRST: Focus on ego, rivalries, sheer speed, danger, pit-stop pressure, heartbreak, "
-        "and real-world comparisons anyone instantly feels.\n"
+        "and relatable real-world comparisons.\n"
         "3. STRICTLY FORBIDDEN AI CLICHÉS (instant failure if used anywhere): "
         + ", ".join(f'"{p}"' for p in BANNED_AI_PHRASES)
         + ".\n\n"
-        "PACING, VISUALS & SEAMLESS LOOP RULES:\n"
-        "4. Break the story into **8 to 10 punchy 1-sentence beats** (each beat = ONE clear, conversational "
-        "sentence of ~10-14 words, because TTS runs at a relaxed -10% speed with 0.35s breathing pauses between beats).\n"
-        "5. Total spoken words across ALL beats MUST be **105 to 122 words** (strictly inside 95-128 words).\n"
-        "6. Beat 0 (0-2s Curiosity-Gap Hook): Open with an immediate curiosity gap or jaw-dropping contrast in the first 2 seconds—never a greeting.\n"
-        "7. REAL F1 PHOTO QUERIES: For EVERY beat, provide a clean Wikimedia Commons search query in `photo_query` "
-        "naming the specific driver, team, car, or track (plus a distinct `secondary_photo_query` for fast mid-beat visual cuts). "
-        "Examples: 'Max Verstappen Red Bull Formula 1', 'Ferrari F1 pit stop', 'Lewis Hamilton Mercedes Formula 1', "
-        "'Monaco Grand Prix Formula 1', 'Ayrton Senna McLaren Formula 1'.\n"
-        "8. MID-VIDEO ATTENTION BADGES: Put a punchy 2-4 word stat/detail pop-up in `callout_badge` on at least "
-        "5 beats (e.g. '350+ KM/H', '5G BRAKING', '1.8s PIT STOP', '$100M FINE', 'ONLY 6 CARS').\n"
-        "9. SEAMLESS LOOP ENDING: Write the final beat's closing words so they flow grammatically and naturally "
-        "straight back into Beat 0's opening words, paired with a quick comment-bait question.\n"
-        "10. HIGH-CLICK THUMBNAIL & METADATA:\n"
+        "SHORTS v4 SCENE-BY-SCENE VISUAL STORYBOARDING RULES:\n"
+        "4. Return an ordered list of **7 to 9 scenes** (`scenes`, strictly inside 6-10). Each scene is "
+        "1-2 punchy sentences (~3-5 seconds of narration, ~11-16 words), totaling **105 to 128 spoken words** "
+        "(strictly inside 95-135 words).\n"
+        "5. Scene 0 (0-2s Curiosity-Gap Hook): Open with an immediate curiosity gap or shocking contrast in the "
+        "first 2 seconds—never a greeting.\n"
+        "6. STRICT NARRATION-TO-IMAGE MATCHING (CRITICAL): For EVERY SINGLE scene:\n"
+        "   - `narration`: The exact spoken lines for that scene.\n"
+        "   - `visual_query`: A highly specific real-photograph search query matching the EXACT subject, "
+        "setting, and race/event spoken in that scene's `narration`! Examples:\n"
+        "       * Driver speaking post-race -> 'Max Verstappen post race interview press conference Las Vegas F1'\n"
+        "       * Ferrari pit stop mistake -> 'Ferrari F1 pit stop crew mechanics race'\n"
+        "       * Specific crash or overtake -> include driver names, teams, and track/year (e.g. 'Lewis Hamilton Max Verstappen Silverstone 2021 F1')\n"
+        "       * Every scene MUST have a unique, fresh `visual_query`—never repeat generic queries!\n"
+        "   - `fallback_query`: A slightly broader, still context-accurate F1 real-photo query for the same "
+        "driver/team/setting in case `visual_query` returns fewer than 2 valid photos (e.g. 'Max Verstappen Red Bull F1', 'Ferrari F1 pit lane').\n"
+        "   - `stat_badge`: Optional short 2-4 word on-screen callout ONLY when this scene mentions a concrete "
+        "stat, quote, year, or lap number (e.g. '350+ KM/H', 'LAP 58', '1.80s STOP', '$100M FINE'). Leave '' when no stat/quote/lap is mentioned.\n"
+        "7. SEAMLESS LOOP ENDING: Write the final scene's closing narration so its grammar and rhythm flow "
+        "directly back into Scene 0's opening words, paired with a crisp debate question in `comment_question`.\n"
+        "8. HIGH-CLICK THUMBNAIL & METADATA:\n"
         "   - `thumbnail_hook`: Bold 3-4 word ALL CAPS hook (e.g. 'ONLY 6 CARS!', '350 KM/H CHAOS').\n"
-        "   - `hero_photo_query`: Most dramatic real F1 photo query for the thumbnail.\n"
+        "   - `hero_photo_query`: Most dramatic real F1 photo query for the custom thumbnail.\n"
         "   - `title`: Clickable curiosity-gap title STRICTLY under 60 characters, ending with `#shorts`.\n"
         "   - `description`: SEO-rich 2-sentence casual hook summary + `#f1 #shorts #formula1` + 2-3 topic hashtags.\n"
         "   - `tags`: 12-15 high-volume F1 tags.\n"
@@ -294,20 +300,21 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
             )
 
         prompt = (
-            "Write the casual-friendly YouTube Short script, beat-by-beat real F1 photo queries, "
-            "mid-video pop-up callout badges, thumbnail hook, and metadata for this verified F1 topic:\n\n"
+            "Write the Shorts v4 scene-by-scene narration-matched visual storyboard, thumbnail hook, "
+            "and YouTube metadata for this verified F1 topic:\n\n"
             f"{json.dumps(topic, indent=2, ensure_ascii=False)}"
             f"{retry_note}\n\n"
             "Checklist before outputting JSON:\n"
-            "- 8 to 10 beats, ONE punchy sentence per beat, 105-122 total spoken words.\n"
+            "- 7 to 9 ordered `scenes` (each 1-2 sentences, 105-128 total spoken words).\n"
+            "- Every scene has a unique, specific `visual_query` matching its exact narration + a broader `fallback_query`.\n"
+            "- Include `stat_badge` ONLY on scenes that mention a concrete stat, quote, year, or lap number.\n"
             "- Zero unexplained engineering jargon, zero AI clichés.\n"
-            "- Every beat has a specific Wikimedia Commons F1 `photo_query`, and at least 5 beats have a punchy `callout_badge`.\n"
             "- Title strictly under 60 characters ending with `#shorts`, `thumbnail_hook` is 3-4 bold words.\n"
-            "- Final beat loops seamlessly back into Beat 0."
+            "- Final scene loops seamlessly back into Scene 0."
         )
 
         logger.info(
-            "Writing casual-friendly storyteller script for '%s' (attempt %d/%d)...",
+            "Writing Shorts v4 scene-by-scene storyboard for '%s' (attempt %d/%d)...",
             topic["topic_slug"],
             attempt,
             max_attempts,
@@ -319,7 +326,6 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
             enable_web_search=False,
         )
 
-        # Normalize harmless formatting edges before strict validation
         script.title = normalize_title(script.title)
         script.thumbnail_hook = normalize_thumbnail_hook(script.thumbnail_hook)
         script.description = normalize_description(script.description)
@@ -327,7 +333,7 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
 
         errors = validate_script(script)
         if not errors:
-            full_spoken = " ".join(b.spoken_text.strip() for b in script.beats)
+            full_spoken = " ".join(s.narration.strip() for s in script.scenes)
             payload = script.model_dump()
             payload.update(
                 {
@@ -353,5 +359,5 @@ async def _write_validated_script_async(topic: dict[str, Any], max_attempts: int
 
 
 def write_validated_script(topic: dict[str, Any]) -> dict[str, Any]:
-    """Synchronous entry point to generate and validate a Shorts script."""
+    """Synchronous entry point to generate and validate a Shorts v4 scene-by-scene script."""
     return asyncio.run(_write_validated_script_async(topic))

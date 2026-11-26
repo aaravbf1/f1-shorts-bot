@@ -38,9 +38,49 @@ WIKIMEDIA_HEADERS = {
     "User-Agent": "F1ShortsEngine/2.0 (https://github.com/aaravbf1/f1-shorts-bot; autonomous-f1-shorts)"
 }
 
-# Reject non-photographic assets, maps, logos, flags, diagrams, and stock watermarks
+# Reject logos, vector graphics, cartoons, toy/diecast models, maps, diagrams, stock watermarks, and non-F1 series
 EXCLUDED_IMAGE_PATTERNS = (
     "logo",
+    "vector",
+    "svg",
+    "clipart",
+    "cartoon",
+    "comic",
+    "anime",
+    "caricature",
+    "illustration",
+    "drawing",
+    "sketch",
+    "3d_render",
+    "3d render",
+    "cgi",
+    "toy",
+    "diecast",
+    "die-cast",
+    "miniature",
+    "scale_model",
+    "scale model",
+    "1_18",
+    "1_43",
+    "1-18",
+    "1-43",
+    "1:18",
+    "1:43",
+    "lego",
+    "hot_wheels",
+    "hotwheels",
+    "burago",
+    "bburago",
+    "minichamps",
+    "model_car",
+    "model car",
+    "figurine",
+    "rc_car",
+    "playmobil",
+    "funko",
+    "slot_car",
+    "tamiya",
+    "revell",
     "flag",
     "map",
     "circuit_layout",
@@ -83,6 +123,10 @@ EXCLUDED_IMAGE_PATTERNS = (
     "rally",
     "wrc",
     "dtm",
+    "le_mans",
+    "le mans",
+    "24_hours",
+    "24 hours",
 )
 
 FALLBACK_F1_PHOTO_QUERIES = [
@@ -172,41 +216,67 @@ def _is_valid_photo_candidate(title: str, width: int, height: int, mime: str) ->
     return True
 
 
-def _search_wikimedia_commons(query: str, limit: int = 12) -> list[dict[str, Any]]:
-    """Query Wikimedia Commons API for high-res (>=800px) real Formula 1 photographs with strict timeout."""
+def _extract_subject_keywords(query: str) -> list[str]:
+    """Extract distinctive driver/team/track/event keywords (dropping generic filler words)."""
+    generic = {
+        "formula", "one", "grand", "prix", "race", "racing", "car", "cars", "track",
+        "post", "profile", "close", "atmosphere", "empty", "heavy", "broken", "angry",
+        "surface", "camera", "onboard", "start", "the", "and", "with", "from", "into",
+        "f1", "gp",
+    }
+    words = re.findall(r"[A-Za-z0-9]+", query)
+    return [w for w in words if len(w) >= 3 and w.lower() not in generic]
+
+
+def _query_wikimedia_raw(gsrsearch: str, limit: int) -> dict[str, Any]:
+    resp = requests.get(
+        "https://commons.wikimedia.org/w/api.php",
+        params={
+            "action": "query",
+            "format": "json",
+            "generator": "search",
+            "gsrsearch": gsrsearch,
+            "gsrnamespace": 6,
+            "gsrlimit": limit,
+            "prop": "imageinfo",
+            "iiprop": "url|size|mime",
+            "iiurlwidth": 1600,
+        },
+        headers=WIKIMEDIA_HEADERS,
+        timeout=(6, min(12, HTTP_TIMEOUT_SEC)),
+    )
+    resp.raise_for_status()
+    return resp.json().get("query", {}).get("pages", {})
+
+
+def _search_wikimedia_commons(query: str, limit: int = 14) -> list[dict[str, Any]]:
+    """Query Wikimedia Commons API for high-res (>=800px) real F1 photos with negative filters & subject relevance."""
     clean_q = re.sub(r"[^\w\s\-']", " ", query).strip()
     if not clean_q:
         return []
     tokens = [t for t in clean_q.split() if len(t) > 1]
-    if len(tokens) > 5:
-        tokens = tokens[:5]
-    clean_q = " ".join(tokens)
-    if not any(tok in clean_q.lower() for tok in ("f1", "formula", "grand prix")):
-        clean_q = f"{clean_q} Formula 1"
+    subject_kws = _extract_subject_keywords(clean_q)
+    neg_terms = "-logo -cartoon -toy -diecast -miniature -svg -diagram -map -flag"
 
+    # Attempt 1: Specific query (up to 5 focused tokens)
+    q1_tokens = tokens[:5]
+    q1 = " ".join(q1_tokens)
+    if not any(tok in q1.lower() for tok in ("f1", "formula", "grand prix")):
+        q1 = f"{q1} F1"
+
+    pages: dict[str, Any] = {}
     try:
-        resp = requests.get(
-            "https://commons.wikimedia.org/w/api.php",
-            params={
-                "action": "query",
-                "format": "json",
-                "generator": "search",
-                "gsrsearch": f"filetype:bitmap {clean_q}",
-                "gsrnamespace": 6,
-                "gsrlimit": limit,
-                "prop": "imageinfo",
-                "iiprop": "url|size|mime",
-                "iiurlwidth": 1600,
-            },
-            headers=WIKIMEDIA_HEADERS,
-            timeout=(6, min(12, HTTP_TIMEOUT_SEC)),
-        )
-        resp.raise_for_status()
-        pages = resp.json().get("query", {}).get("pages", {})
+        pages = _query_wikimedia_raw(f"filetype:bitmap {q1} {neg_terms}", limit=limit)
+        # Attempt 2: If strict AND on 5 words returned <2 hits, relax to top 3 distinctive subject nouns + F1
+        if len(pages) < 2 and len(subject_kws) >= 2:
+            relaxed = " ".join(subject_kws[:3]) + " F1"
+            more_pages = _query_wikimedia_raw(f"filetype:bitmap {relaxed} {neg_terms}", limit=limit)
+            pages.update(more_pages)
     except Exception as exc:
         logger.debug("Wikimedia Commons search failed for '%s': %s", clean_q, exc)
         return []
 
+    query_terms = {kw.lower() for kw in subject_kws}
     candidates: list[dict[str, Any]] = []
     for page in pages.values():
         title = str(page.get("title", ""))
@@ -220,21 +290,24 @@ def _search_wikimedia_commons(query: str, limit: int = 12) -> list[dict[str, Any
         url = str(ii.get("thumburl") or ii.get("url") or "")
         if not url or not _is_valid_photo_candidate(title, w, h, mime):
             continue
-        # Score higher for sharper photos and portrait/4:3 friendly framing
+        title_l = title.lower()
+        term_hits = sum(1 for qt in query_terms if qt in title_l)
         aspect = w / max(1, h)
-        portrait_bonus = 2.0 if aspect <= 1.1 else (1.2 if aspect <= 1.55 else 0.8)
-        score = min(w, 2400) * portrait_bonus
+        portrait_bonus = 1.6 if aspect <= 1.15 else (1.2 if aspect <= 1.55 else 0.85)
+        score = (term_hits * 2200.0) + (min(w, 2200) * portrait_bonus)
         candidates.append({"title": title, "url": url, "width": w, "height": h, "score": score})
 
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates
 
 
-def _search_wikipedia_pageimages(query: str, limit: int = 6) -> list[dict[str, Any]]:
-    """Secondary search using Wikipedia API pageimages for specific drivers, circuits, and races."""
+def _search_wikipedia_pageimages(query: str, limit: int = 8) -> list[dict[str, Any]]:
+    """Secondary search using Wikipedia API pageimages, strictly filtering for subject keyword relevance."""
     clean_q = re.sub(r"[^\w\s\-']", " ", query).strip()
     if not clean_q:
         return []
+    subject_kws = _extract_subject_keywords(clean_q)
+    search_str = " ".join(subject_kws[:4]) if subject_kws else clean_q
     try:
         resp = requests.get(
             "https://en.wikipedia.org/w/api.php",
@@ -242,7 +315,7 @@ def _search_wikipedia_pageimages(query: str, limit: int = 6) -> list[dict[str, A
                 "action": "query",
                 "format": "json",
                 "generator": "search",
-                "gsrsearch": f"{clean_q} Formula One",
+                "gsrsearch": f"{search_str} Formula One",
                 "gsrlimit": limit,
                 "prop": "pageimages",
                 "piprop": "original|thumbnail",
@@ -257,6 +330,7 @@ def _search_wikipedia_pageimages(query: str, limit: int = 6) -> list[dict[str, A
         logger.debug("Wikipedia pageimages search failed for '%s': %s", clean_q, exc)
         return []
 
+    query_terms = {kw.lower() for kw in subject_kws}
     candidates: list[dict[str, Any]] = []
     for page in pages.values():
         title = str(page.get("title", ""))
@@ -269,7 +343,12 @@ def _search_wikipedia_pageimages(query: str, limit: int = 6) -> list[dict[str, A
         mime = "image/png" if url.lower().endswith(".png") else "image/jpeg"
         if url.lower().endswith(".svg") or not _is_valid_photo_candidate(url + " " + title, w, h, mime):
             continue
-        candidates.append({"title": title, "url": url, "width": w, "height": h, "score": w})
+        # Require at least 1 real subject keyword hit in page title or image filename so unrelated drivers never match!
+        haystack = f"{title} {url}".lower()
+        term_hits = sum(1 for qt in query_terms if qt in haystack)
+        if query_terms and term_hits == 0:
+            continue
+        candidates.append({"title": title, "url": url, "width": w, "height": h, "score": term_hits * 2000.0 + w})
 
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates
@@ -327,115 +406,204 @@ def _pick_photo_for_query(query: str, used_urls: set[str]) -> Path | None:
     return None
 
 
-def _fetch_candidate_pool_for_query(query: str, max_downloads: int = 2) -> list[Path]:
-    """Fetch up to `max_downloads` verified high-res F1 photos for a query within a strict 15s cap."""
-    deadline = time.monotonic() + 15.0
-    candidates = _search_wikimedia_commons(query, limit=10)
-    if len(candidates) < 2 and time.monotonic() < deadline - 4.0:
-        candidates.extend(_search_wikipedia_pageimages(query, limit=4))
+def _compute_image_fingerprint(path: Path) -> tuple[str, str]:
+    """Return (sha1_hex, 64-bit perceptual dhash) so identical or resized duplicate images never repeat."""
+    raw_hash = hashlib.sha1(path.read_bytes()).hexdigest()[:16]
+    try:
+        with Image.open(path) as im:
+            small = im.convert("L").resize((9, 8), Image.Resampling.BILINEAR)
+            pixels = list(small.getdata())
+        bits = []
+        for row in range(8):
+            offset = row * 9
+            for col in range(8):
+                bits.append("1" if pixels[offset + col] > pixels[offset + col + 1] else "0")
+        dhash = f"{int(''.join(bits), 2):016x}"
+    except Exception:
+        dhash = raw_hash
+    return raw_hash, dhash
 
-    results: list[Path] = []
+
+def _search_and_download_scene(
+    visual_query: str,
+    fallback_query: str,
+    max_downloads: int = 3,
+) -> list[dict[str, Any]]:
+    """Search visual_query first (strict 15s cap); fall back to fallback_query if < 2 valid images found."""
+    deadline = time.monotonic() + 15.0
+
+    # Tier 1: Ultra-specific visual_query
+    primary_cands = _search_wikimedia_commons(visual_query, limit=14)
+    if len(primary_cands) < 2 and time.monotonic() < deadline - 5.0:
+        primary_cands.extend(_search_wikipedia_pageimages(visual_query, limit=5))
+
+    tagged_cands: list[tuple[str, dict[str, Any]]] = [("visual_query", c) for c in primary_cands]
+
+    # Tier 2: Broader context-accurate fallback_query ONLY if visual_query returned < 2 valid candidates
+    if len(primary_cands) < 2 and fallback_query and time.monotonic() < deadline - 3.0:
+        fb_cands = _search_wikimedia_commons(fallback_query, limit=12)
+        if len(fb_cands) < 2 and time.monotonic() < deadline - 2.0:
+            fb_cands.extend(_search_wikipedia_pageimages(fallback_query, limit=5))
+        tagged_cands.extend(("fallback_query", c) for c in fb_cands)
+
+    downloaded_items: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
-    for cand in candidates:
-        if len(results) >= max_downloads or time.monotonic() >= deadline:
+    for matched_via, cand in tagged_cands:
+        if len(downloaded_items) >= max_downloads or time.monotonic() >= deadline:
             break
         url = cand["url"]
         if url in seen_urls:
             continue
         seen_urls.add(url)
-        downloaded = _download_verified_photo(url)
-        if downloaded:
-            results.append(downloaded)
-    return results
+        path = _download_verified_photo(url)
+        if path:
+            sha1_h, dhash = _compute_image_fingerprint(path)
+            downloaded_items.append(
+                {
+                    "path": path,
+                    "url": url,
+                    "title": cand.get("title", path.name),
+                    "matched_via": matched_via,
+                    "sha1": sha1_h,
+                    "dhash": dhash,
+                }
+            )
+    return downloaded_items
 
 
-def fetch_f1_photos_for_script(script_data: dict[str, Any]) -> tuple[Path, list[list[Path]]]:
-    """Concurrently fetch real, high-res, watermark-free F1 photos with strict timeouts and instant fallbacks."""
+def fetch_f1_photos_for_script(
+    script_data: dict[str, Any],
+) -> tuple[Path, list[Path], list[dict[str, Any]]]:
+    """Shorts v4: Fetch ONE dedicated, unique, unrepeated high-res real F1 photo per scene.
+
+    Uses each scene's `visual_query` first, falling back to `fallback_query` only when <2 valid
+    images are returned. Tracks URLs, SHA-1 hashes, and perceptual dHashes across the entire video
+    so the exact same photo NEVER appears twice in one Short.
+    """
     ensure_directories()
     t0 = time.monotonic()
 
+    scenes = script_data.get("scenes") or script_data.get("beats") or []
     hero_query = str(
         script_data.get("hero_photo_query")
-        or (script_data.get("beats") or [{}])[0].get("photo_query")
+        or (scenes[0].get("visual_query") or scenes[0].get("photo_query") if scenes else "")
         or script_data.get("title")
         or "Formula One race car"
     )
-    beats = script_data.get("beats", [])
+    hero_fallback = str(
+        (scenes[0].get("fallback_query") if scenes else "") or "Formula One race car track"
+    )
 
-    # Build deduplicated query list: hero + each beat's primary/secondary queries + 4 safety fallbacks
-    query_tasks: dict[str, str] = {"hero": hero_query}
-    for idx, beat in enumerate(beats):
-        q1 = str(beat.get("photo_query") or hero_query).strip()
-        q2 = str(beat.get("secondary_photo_query") or "").strip()
-        query_tasks[f"beat_{idx}_a"] = q1
-        if q2:
-            query_tasks[f"beat_{idx}_b"] = q2
+    task_specs: dict[str, tuple[str, str]] = {"hero": (hero_query, hero_fallback)}
+    for idx, sc in enumerate(scenes):
+        vq = str(sc.get("visual_query") or sc.get("photo_query") or hero_query).strip()
+        fq = str(sc.get("fallback_query") or sc.get("secondary_photo_query") or hero_fallback).strip()
+        task_specs[f"scene_{idx}"] = (vq, fq)
     for fi, fq in enumerate(FALLBACK_F1_PHOTO_QUERIES[:4]):
-        query_tasks[f"fallback_{fi}"] = fq
+        task_specs[f"safety_{fi}"] = (fq, "")
 
-    fetched_by_key: dict[str, list[Path]] = {}
-    logger.info("Concurrently fetching real F1 photos for %d queries (15s timeout/query)...", len(query_tasks))
+    fetched_by_key: dict[str, list[dict[str, Any]]] = {}
+    logger.info(
+        "Shorts v4: Fetching unique narration-matched F1 photos for %d scene(s) + hero (15s cap/scene)...",
+        len(scenes),
+    )
     with ThreadPoolExecutor(max_workers=5) as pool:
         future_map = {
-            pool.submit(_fetch_candidate_pool_for_query, q, 2 if k.endswith("_a") or k == "hero" else 1): k
-            for k, q in query_tasks.items()
+            pool.submit(_search_and_download_scene, vq, fq, 3 if key.startswith("scene_") or key == "hero" else 2): key
+            for key, (vq, fq) in task_specs.items()
         }
         try:
-            for fut in as_completed(future_map, timeout=50.0):
+            for fut in as_completed(future_map, timeout=55.0):
                 key = future_map[fut]
                 try:
                     fetched_by_key[key] = fut.result(timeout=1.0)
                 except Exception as exc:
-                    logger.debug("Photo task %s skipped: %s", key, exc)
+                    logger.debug("Photo fetch task %s failed: %s", key, exc)
                     fetched_by_key[key] = []
         except Exception as exc:
-            logger.warning("Global photo fetch budget reached (%.1fs): %s — proceeding with fetched + cached photos.", time.monotonic() - t0, exc)
+            logger.warning("Global photo fetch cap reached (%.1fs): %s — proceeding with fetched + cached pool.", time.monotonic() - t0, exc)
 
-    # Assemble unique fallback pool from all downloaded + cached photos
-    all_valid_pool: list[Path] = []
-    for paths in fetched_by_key.values():
-        for p in paths:
-            if p not in all_valid_pool:
-                all_valid_pool.append(p)
+    # Build deduplicated global safety pool (fetched safety queries + cached local photos)
+    safety_pool: list[dict[str, Any]] = []
+    for k, items in fetched_by_key.items():
+        if k.startswith("safety_"):
+            safety_pool.extend(items)
     for cached in sorted(PHOTOS_DIR.glob("f1_*.jpg")):
-        if cached.stat().st_size > 15_000 and cached not in all_valid_pool:
-            all_valid_pool.append(cached)
+        if cached.stat().st_size > 15_000:
+            sha1_h, dhash = _compute_image_fingerprint(cached)
+            safety_pool.append(
+                {
+                    "path": cached,
+                    "url": str(cached),
+                    "title": cached.name,
+                    "matched_via": "cached_pool",
+                    "sha1": sha1_h,
+                    "dhash": dhash,
+                }
+            )
 
-    used_paths: set[Path] = set()
-    pool_cursor = 0
+    used_urls: set[str] = set()
+    used_sha1: set[str] = set()
+    used_dhash: set[str] = set()
 
-    def _take_unused(preferred: list[Path]) -> Path:
-        nonlocal pool_cursor
-        for p in preferred:
-            if p not in used_paths:
-                used_paths.add(p)
-                return p
-        while pool_cursor < len(all_valid_pool):
-            cand = all_valid_pool[pool_cursor]
-            pool_cursor += 1
-            if cand not in used_paths:
-                used_paths.add(cand)
-                return cand
-        if all_valid_pool:
-            return random.choice(all_valid_pool)
-        return ensure_backgrounds()["f1_red"]
+    def _is_unused(item: dict[str, Any]) -> bool:
+        return (
+            item["url"] not in used_urls
+            and item["sha1"] not in used_sha1
+            and item["dhash"] not in used_dhash
+        )
 
-    hero_photo = _take_unused(fetched_by_key.get("hero", []))
-    beat_photos: list[list[Path]] = []
-    for idx in range(len(beats)):
-        primary_list = fetched_by_key.get(f"beat_{idx}_a", [])
-        secondary_list = fetched_by_key.get(f"beat_{idx}_b", [])
-        p1 = _take_unused(primary_list)
-        p2 = _take_unused(secondary_list + primary_list)
-        beat_photos.append([p1, p2] if p2 != p1 else [p1])
+    def _mark_used(item: dict[str, Any]) -> None:
+        used_urls.add(item["url"])
+        used_sha1.add(item["sha1"])
+        used_dhash.add(item["dhash"])
+
+    def _select_unique(preferred: list[dict[str, Any]]) -> dict[str, Any]:
+        for item in preferred:
+            if _is_unused(item):
+                _mark_used(item)
+                return item
+        for item in safety_pool:
+            if _is_unused(item):
+                _mark_used(item)
+                return item
+        if preferred:
+            return preferred[0]
+        if safety_pool:
+            return random.choice(safety_pool)
+        bg = ensure_backgrounds()["f1_red"]
+        return {"path": bg, "url": str(bg), "title": bg.name, "matched_via": "fallback_bg", "sha1": "", "dhash": ""}
+
+    hero_item = _select_unique(fetched_by_key.get("hero", []))
+    hero_photo: Path = hero_item["path"]
+
+    scene_photos: list[Path] = []
+    scene_meta: list[dict[str, Any]] = []
+    for idx in range(len(scenes)):
+        picked = _select_unique(fetched_by_key.get(f"scene_{idx}", []))
+        scene_photos.append(picked["path"])
+        scene_meta.append(
+            {
+                "scene_index": idx,
+                "matched_via": picked["matched_via"],
+                "image_title": picked["title"],
+                "photo_path": str(picked["path"]),
+            }
+        )
+        logger.info(
+            "  Scene %d/%d image locked [%s]: %s",
+            idx + 1,
+            len(scenes),
+            picked["matched_via"],
+            picked["title"][:64],
+        )
 
     logger.info(
-        "Prepared hero + %d real F1 beat photo sets in %.1fs (pool=%d verified photos).",
-        len(beat_photos),
+        "Shorts v4: Locked hero + %d unique scene photos in %.1fs (0 duplicates).",
+        len(scene_photos),
         time.monotonic() - t0,
-        len(all_valid_pool),
     )
-    return hero_photo, beat_photos
+    return hero_photo, scene_photos, scene_meta
 
 
 def compose_full_bleed_vertical_photo(

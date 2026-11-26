@@ -260,10 +260,10 @@ async def _build_timed_voiceover(
     rate: str = TTS_RATE,
     pitch: str = TTS_PITCH,
 ) -> tuple[Path, list[TimedBeat], list[TimedWord], float]:
-    """Synthesize beat-by-beat narration (-6% pace, +0Hz pitch, 0.25s breath pauses, -14 LUFS)."""
-    beats_raw = script_data.get("beats", [])
+    """Generate per-scene TTS audio (-6% pace, +0Hz, 0.25s breath pauses, -14 LUFS) and measure exact scene durations."""
+    beats_raw = script_data.get("scenes") or script_data.get("beats") or []
     if not beats_raw:
-        raise ValueError("Script has no visual beats to render.")
+        raise ValueError("Script has no scenes/beats to render.")
 
     primary_rgb = _resolve_team_rgb(script_data.get("primary_team_color", "f1_red"))
     secondary_rgb = _resolve_team_rgb(script_data.get("secondary_team_color", "gold"), "gold")
@@ -271,16 +271,16 @@ async def _build_timed_voiceover(
     timed_beats: list[TimedBeat] = []
     beat_wavs: list[Path] = []
     lead_in_sec = THUMBNAIL_FLASH_SEC  # 0.15s dedicated thumbnail hook frame at t=0
-    inter_beat_gap = INTER_BEAT_GAP_SEC  # 0.25s natural breath pause between 1-sentence beats
+    inter_beat_gap = INTER_BEAT_GAP_SEC  # 0.25s natural breath pause between scenes
     cursor = lead_in_sec
 
     for idx, beat in enumerate(beats_raw):
-        spoken = str(beat.get("spoken_text", "")).strip()
+        spoken = str(beat.get("narration") or beat.get("spoken_text") or "").strip()
         if not spoken:
             continue
 
-        raw_mp3 = work_dir / f"beat_{idx:02d}_raw.mp3"
-        trimmed_wav = work_dir / f"beat_{idx:02d}_trim.wav"
+        raw_mp3 = work_dir / f"scene_{idx:02d}_raw.mp3"
+        trimmed_wav = work_dir / f"scene_{idx:02d}_trim.wav"
 
         raw_words = await _synthesize_beat_tts(spoken, raw_mp3, voice=voice, rate=rate, pitch=pitch)
         _trim_silence_ffmpeg(raw_mp3, trimmed_wav, ffmpeg_bin)
@@ -310,7 +310,7 @@ async def _build_timed_voiceover(
             TimedBeat(
                 index=idx,
                 card_type=str(beat.get("card_type", "story_card")).strip().lower(),
-                callout_badge=str(beat.get("callout_badge", "")).strip(),
+                callout_badge=str(beat.get("stat_badge") or beat.get("callout_badge") or "").strip(),
                 header=str(beat.get("card_header", "")).strip(),
                 subtext=str(beat.get("card_subtext", "")).strip(),
                 stat_value=str(beat.get("stat_value", "")).strip(),
@@ -464,7 +464,7 @@ def _mix_master_audio(
             f"atrim=0:{total_duration:.3f},"
             f"afade=t=in:st=0:d=0.5,"
             f"afade=t=out:st={fade_out_start:.3f}:d=1.0,"
-            f"volume=-23dB[bgm]"
+            f"volume=-25dB[bgm]"
         ),
     ]
     mix_labels = ["[vo]", "[bgm]"]
@@ -839,40 +839,30 @@ def _draw_active_subtitle(
 
 def _build_photo_shots(
     timed_beats: list[TimedBeat],
-    beat_photo_paths: list[list[Path]],
+    scene_photo_paths: list[Path],
     total_duration: float,
 ) -> list[PhotoShot]:
-    """Build a timeline of oversized full-bleed real F1 photos swapping every ~2.5-3.5s with Ken Burns motion."""
+    """Shorts v4: Lock each scene's ONE dedicated matched F1 photo to the exact duration of its narration clip."""
     oversize_w = int(VIDEO_WIDTH * 1.12)
     oversize_h = int(VIDEO_HEIGHT * 1.12)
     shots: list[PhotoShot] = []
-    shot_idx = 0
 
     for i, beat in enumerate(timed_beats):
+        # Cut switches at the exact start of the next scene's narration so visuals stay 100% locked to voice!
         seg_start = beat.start if i > 0 else THUMBNAIL_FLASH_SEC
         seg_end = timed_beats[i + 1].start if i + 1 < len(timed_beats) else total_duration
-        seg_dur = max(0.5, seg_end - seg_start)
-        paths = beat_photo_paths[i] if i < len(beat_photo_paths) else beat_photo_paths[-1]
+        p_path = scene_photo_paths[i] if i < len(scene_photo_paths) else scene_photo_paths[-1]
 
-        # Swap photo mid-beat when beat > ~3.6s and we have a second real F1 photo (2.5-3.5s cuts!)
-        if len(paths) >= 2 and seg_dur >= max(3.5, PHOTO_SWAP_INTERVAL_SEC + 0.4):
-            mid = seg_start + seg_dur * 0.5
-            sub_pairs = [(seg_start, mid, paths[0]), (mid, seg_end, paths[1])]
-        else:
-            sub_pairs = [(seg_start, seg_end, paths[0])]
-
-        for s_start, s_end, p_path in sub_pairs:
-            composed = compose_full_bleed_vertical_photo(p_path, oversize_w, oversize_h)
-            shots.append(
-                PhotoShot(
-                    start=s_start,
-                    end=s_end,
-                    image=composed,
-                    zoom_in=(shot_idx % 2 == 0),
-                    pan_dir=(-1 if shot_idx % 3 == 0 else (1 if shot_idx % 3 == 1 else 0)),
-                )
+        composed = compose_full_bleed_vertical_photo(p_path, oversize_w, oversize_h)
+        shots.append(
+            PhotoShot(
+                start=seg_start,
+                end=seg_end,
+                image=composed,
+                zoom_in=(i % 2 == 0),
+                pan_dir=(-1 if i % 3 == 0 else (1 if i % 3 == 1 else 0)),
             )
-            shot_idx += 1
+        )
 
     return shots
 
@@ -932,8 +922,8 @@ def build_short_video(
     accent_rgb = _resolve_team_rgb(primary_color_name)
     category_label = str(script_data.get("category_label", "Formula 1"))
 
-    # 1. Fetch real, high-resolution, watermark-free F1 photos matched to every beat + hero thumbnail
-    hero_photo_path, beat_photo_paths = fetch_f1_photos_for_script(script_data)
+    # 1. Fetch ONE dedicated, unique, narration-matched real F1 photo per scene + hero thumbnail
+    hero_photo_path, scene_photo_paths, scene_match_meta = fetch_f1_photos_for_script(script_data)
 
     # 2. Generate vibrant high-contrast 1080x1920 custom thumbnail image
     thumb_hook = str(script_data.get("thumbnail_hook") or script_data.get("title") or "INSANE F1 STORY")
@@ -951,7 +941,7 @@ def build_short_video(
         work_dir = Path(tmp)
 
         logger.info(
-            "Synthesizing Shorts v3 voiceover (%s, rate=%s, pitch=%s, pause=%.2fs, -14 LUFS)...",
+            "Synthesizing Shorts v4 per-scene voiceover (%s, rate=%s, pitch=%s, pause=%.2fs, -14 LUFS)...",
             voice,
             rate,
             pitch,
@@ -964,11 +954,14 @@ def build_short_video(
         if total_duration >= 60.0:
             raise RuntimeError(f"Duration check failed: {total_duration:.2f}s >= 60.0s")
 
-        # 3. Build full-bleed real F1 photo shot timeline (swapping every ~2.5-3.5s)
-        photo_shots = _build_photo_shots(timed_beats, beat_photo_paths, total_duration)
-        logger.info("Prepared %d full-bleed real F1 photo shots with Ken Burns motion.", len(photo_shots))
+        # 3. Lock each scene's dedicated photo to the exact audio duration of its narration clip
+        photo_shots = _build_photo_shots(timed_beats, scene_photo_paths, total_duration)
+        for idx, sm in enumerate(scene_match_meta):
+            if idx < len(photo_shots):
+                sm["duration_sec"] = round(photo_shots[idx].end - photo_shots[idx].start, 2)
+        logger.info("Locked %d unique scene photos 1:1 to exact per-scene audio durations.", len(photo_shots))
 
-        logger.info("Mixing -14 LUFS voiceover + -23 dB ambient BGM (0.5s in / 1.0s out) + SFX (duration=%.2fs)...", total_duration)
+        logger.info("Mixing -14 LUFS voiceover + -25 dB ambient BGM (0.5s in / 1.0s out) + SFX (duration=%.2fs)...", total_duration)
         master_audio_path = work_dir / "master_audio.m4a"
         _mix_master_audio(
             voice_wav=voice_wav,
@@ -1044,10 +1037,11 @@ def build_short_video(
 
             frame = _render_ken_burns_frame(active_shot, t)
 
-            # Find active story beat & paste pre-composited HUD directly on RGB frame
+            # Align active scene HUD cut identically with photo shot boundary (exact start of next scene!)
             active_beat_idx = len(timed_beats) - 1
-            for i, b in enumerate(timed_beats):
-                if t <= b.end + INTER_BEAT_GAP_SEC * 0.5:
+            for i in range(len(timed_beats)):
+                seg_end = timed_beats[i + 1].start if i + 1 < len(timed_beats) else total_duration
+                if t < seg_end:
                     active_beat_idx = i
                     break
 
@@ -1126,4 +1120,5 @@ def build_short_video(
         "beat_count": len(timed_beats),
         "photo_shot_count": len(photo_shots),
         "word_count": len(all_words),
+        "scene_matches": scene_match_meta,
     }
