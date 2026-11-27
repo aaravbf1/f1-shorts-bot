@@ -123,7 +123,7 @@ class HistoryStore:
     ) -> tuple[bool, str]:
         """Return (True, reason) if candidate topic/title overlaps >40% with any entry in history.json."""
         cand_slug = slugify(topic_slug)
-        cand_title = re.sub(r"#f1\b", "", title.lower()).strip()
+        cand_title = re.sub(r"(#shorts|#f1)\b", "", title.lower()).strip()
         cand_title_kw = extract_keywords(f"{topic_slug} {cand_title}")
         cand_all_kw = extract_keywords(f"{topic_slug} {cand_title} {summary}")
 
@@ -133,7 +133,7 @@ class HistoryStore:
 
         for item in existing:
             ex_slug = slugify(str(item.get("topic_slug", "")))
-            ex_title = re.sub(r"#f1\b", "", str(item.get("title", "")).lower()).strip()
+            ex_title = re.sub(r"(#shorts|#f1)\b", "", str(item.get("title", "")).lower()).strip()
             ex_summary = str(item.get("angle", "") or item.get("summary", ""))
             ex_explicit_kw = " ".join(str(k) for k in (item.get("keywords") or []))
 
@@ -141,7 +141,7 @@ class HistoryStore:
             if cand_slug and ex_slug and cand_slug == ex_slug:
                 return True, f"Exact slug match with '{ex_slug}'"
 
-            # 2. Title or slug sequence similarity > 40% (strict check on normalized strings)
+            # 2. Slug keyword overlap > 40%
             if cand_slug and ex_slug:
                 slug_tokens = extract_keywords(cand_slug.replace("-", " "))
                 ex_slug_tokens = extract_keywords(ex_slug.replace("-", " "))
@@ -154,9 +154,10 @@ class HistoryStore:
                             f"{sorted(overlap)}) with '{ex_slug}'"
                         )
 
+            # High raw title character similarity (strip #shorts/#f1 first to avoid false positives!)
             if cand_title and ex_title:
                 title_seq = difflib.SequenceMatcher(None, cand_title, ex_title).ratio()
-                if title_seq > 0.52:
+                if title_seq >= 0.72:
                     return True, f"Title similarity {title_seq:.0%} with '{ex_title}'"
 
             # 3. Title+slug keyword overlap > 40%
