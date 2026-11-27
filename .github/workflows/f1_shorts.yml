@@ -23,10 +23,10 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg & fallback TTS runtime
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg espeak-ng
 
       - name: Install Python dependencies
         run: |
@@ -44,7 +44,7 @@ jobs:
           PRIVACY_STATUS: public
           YOUTUBE_PRIVACY_STATUS: public
           TTS_VOICE: "en-US-AndrewMultilingualNeural"
-          TTS_RATE: "-6%"
+          TTS_RATE: "+3%"
           TTS_PITCH: "+0Hz"
           INTER_BEAT_GAP_SEC: "0.25"
           LLM_CALL_TIMEOUT_SEC: "30"

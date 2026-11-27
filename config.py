@@ -50,14 +50,20 @@ TTS_TIMEOUT_SEC = float(os.getenv("TTS_TIMEOUT_SEC", "45"))
 FFMPEG_TIMEOUT_SEC = int(os.getenv("FFMPEG_TIMEOUT_SEC", "120"))
 YOUTUBE_HTTP_TIMEOUT_SEC = int(os.getenv("YOUTUBE_HTTP_TIMEOUT_SEC", "60"))
 
-# TTS configuration (Shorts v3: warm conversational multilingual neural narrator + 0.25s breath pauses)
+# TTS configuration (Shorts v4.1: warm conversational neural narrator +3% pacing, 0.25s breath pauses)
 TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AndrewMultilingualNeural").strip()
-TTS_RATE = os.getenv("TTS_RATE", "-6%").strip()
+TTS_RATE = os.getenv("TTS_RATE", "+3%").strip()
 TTS_PITCH = os.getenv("TTS_PITCH", "+0Hz").strip()
+TTS_INTER_REQUEST_DELAY_SEC = float(os.getenv("TTS_INTER_REQUEST_DELAY_SEC", "0.6"))
+TTS_VOICE_ROTATION = (
+    "en-US-AndrewMultilingualNeural",
+    "en-US-BrianMultilingualNeural",
+    "en-US-ChristopherNeural",
+)
 INTER_BEAT_GAP_SEC = float(os.getenv("INTER_BEAT_GAP_SEC", "0.25"))
 THUMBNAIL_FLASH_SEC = float(os.getenv("THUMBNAIL_FLASH_SEC", "0.15"))
 PHOTO_SWAP_INTERVAL_SEC = float(os.getenv("PHOTO_SWAP_INTERVAL_SEC", "3.0"))
-AVAILABLE_VOICES = ("en-US-AndrewMultilingualNeural", "en-US-BrianMultilingualNeural")
+AVAILABLE_VOICES = TTS_VOICE_ROTATION
 
 # YouTube Data API v3 configuration
 YOUTUBE_SCOPES = [

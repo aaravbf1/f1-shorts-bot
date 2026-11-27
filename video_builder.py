@@ -7,6 +7,7 @@ import inspect
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -38,10 +39,12 @@ from config import (
     TARGET_MAX_DURATION_SEC,
     TEAM_PALETTES,
     THUMBNAIL_FLASH_SEC,
+    TTS_INTER_REQUEST_DELAY_SEC,
     TTS_PITCH,
     TTS_RATE,
     TTS_TIMEOUT_SEC,
     TTS_VOICE,
+    TTS_VOICE_ROTATION,
     VIDEO_FPS,
     VIDEO_HEIGHT,
     VIDEO_WIDTH,
@@ -154,27 +157,163 @@ def _resolve_team_rgb(name: str, default_key: str = "f1_red") -> tuple[int, int,
     return TEAM_PALETTES[default_key]
 
 
+def _sanitize_tts_text(text: str) -> str:
+    """Clean spoken beat text before TTS: strip markdown, emojis, and invalid control characters."""
+    cleaned = str(text or "")
+    # Normalize typography so TTS pronounces quotes/dashes cleanly
+    cleaned = (
+        cleaned.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2014", ", ")
+        .replace("\u2013", ", ")
+        .replace("\u2026", "...")
+    )
+    # Remove markdown symbols & bullet formatting
+    cleaned = re.sub(r"[*_`~#>]+", " ", cleaned)
+    # Remove emojis / pictographs / non-BMP unicode symbols
+    cleaned = re.sub(r"[\U00010000-\U0010ffff]", "", cleaned)
+    cleaned = re.sub(r"[\u2600-\u27bf\ufe0f]", "", cleaned)
+    # Strip control characters and collapse whitespace
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _validate_tts_prosody(rate: str, pitch: str) -> tuple[str, str]:
+    """Guarantee valid Edge-TTS rate (e.g. '+3%') and pitch (e.g. '+0Hz') strings."""
+    r = str(rate or "").strip()
+    p = str(pitch or "").strip()
+    if not re.fullmatch(r"[+-]\d+%", r):
+        r = "+3%"
+    if not re.fullmatch(r"[+-]\d+Hz", p):
+        p = "+0Hz"
+    return r, p
+
+
+def _build_voice_rotation(primary_voice: str) -> list[str]:
+    """Build ordered Edge-TTS voice fallback rotation chain."""
+    chain: list[str] = []
+    for v in (primary_voice, *TTS_VOICE_ROTATION):
+        v_clean = str(v or "").strip()
+        if v_clean and v_clean not in chain:
+            chain.append(v_clean)
+    return chain
+
+
+def _synthesize_fallback_tts(
+    clean_text: str,
+    out_mp3: Path,
+    ffmpeg_bin: str,
+) -> None:
+    """Automatic fallback TTS (gTTS -> local espeak-ng) sped up via FFmpeg atempo=1.12 and normalized to -14 LUFS."""
+    raw_fallback = out_mp3.with_name(f"{out_mp3.stem}_fallback_raw.mp3")
+    raw_wav = out_mp3.with_name(f"{out_mp3.stem}_fallback_espeak.wav")
+    src_audio: Path | None = None
+    last_err: Exception | None = None
+
+    # Fallback Tier 1: gTTS (reliable over HTTPS on GitHub Actions runners)
+    try:
+        from gtts import gTTS  # type: ignore
+
+        logger.warning("Switching to automatic gTTS fallback for beat: %r", clean_text[:60])
+        tts = gTTS(text=clean_text, lang="en", tld="com", slow=False)
+        tts.save(str(raw_fallback))
+        if raw_fallback.exists() and raw_fallback.stat().st_size > 1024:
+            src_audio = raw_fallback
+    except Exception as exc:
+        last_err = exc
+        logger.warning("gTTS fallback failed (%s); checking offline espeak-ng fallback...", exc)
+
+    # Fallback Tier 2: Offline espeak-ng (installed on ubuntu-latest CI)
+    if src_audio is None:
+        espeak_bin = shutil.which("espeak-ng") or shutil.which("espeak")
+        if espeak_bin:
+            try:
+                logger.warning("Switching to offline espeak-ng fallback for beat: %r", clean_text[:60])
+                subprocess.run(
+                    [espeak_bin, "-v", "en-us", "-s", "165", "-w", str(raw_wav), clean_text],
+                    capture_output=True,
+                    check=True,
+                    timeout=30,
+                )
+                if raw_wav.exists() and raw_wav.stat().st_size > 1024:
+                    src_audio = raw_wav
+            except Exception as exc:
+                last_err = exc
+                logger.warning("espeak-ng fallback failed (%s).", exc)
+
+    if src_audio is None:
+        raise RuntimeError(f"All fallback TTS engines (gTTS, espeak-ng) failed: {last_err}") from last_err
+
+    try:
+        subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                str(src_audio),
+                "-af",
+                "atempo=1.12,loudnorm=I=-14:TP=-1.2:LRA=8",
+                "-ar",
+                "44100",
+                "-ac",
+                "1",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "160k",
+                str(out_mp3),
+            ],
+            capture_output=True,
+            check=True,
+            timeout=FFMPEG_TIMEOUT_SEC,
+        )
+    finally:
+        raw_fallback.unlink(missing_ok=True)
+        raw_wav.unlink(missing_ok=True)
+
+    if not out_mp3.exists() or out_mp3.stat().st_size <= 1024:
+        raise RuntimeError("Fallback TTS produced empty audio output.")
+    logger.info("Fallback TTS audio generated cleanly (%d bytes, atempo=1.12, -14 LUFS).", out_mp3.stat().st_size)
+
+
 async def _synthesize_beat_tts(
     text: str,
     out_mp3: Path,
     voice: str,
     rate: str,
     pitch: str = TTS_PITCH,
+    ffmpeg_bin: str | None = None,
+    force_fallback: bool = False,
 ) -> list[TimedWord]:
-    """Generate TTS audio with edge-tts (multilingual neural narrator) and extract WordBoundary timestamps."""
-    kwargs: dict[str, Any] = {"voice": voice, "rate": rate, "pitch": pitch}
-    sig = inspect.signature(edge_tts.Communicate.__init__)
-    if "boundary" in sig.parameters:
-        kwargs["boundary"] = "WordBoundary"
+    """Generate beat TTS via hardened edge-tts (5 retries, exponential backoff, voice rotation) + gTTS fallback."""
+    clean_text = _sanitize_tts_text(text)
+    if not clean_text:
+        raise ValueError("Cannot synthesize empty spoken text after sanitization.")
 
-    async def _run_tts() -> list[TimedWord]:
-        communicator = edge_tts.Communicate(text, **kwargs)
+    safe_rate, safe_pitch = _validate_tts_prosody(rate, pitch)
+    voices = _build_voice_rotation(voice)
+    backoffs = (1.0, 2.0, 4.0, 6.0, 8.0)
+
+    sig = inspect.signature(edge_tts.Communicate.__init__)
+    supports_boundary = "boundary" in sig.parameters
+
+    async def _run_edge_once(active_voice: str) -> list[TimedWord]:
+        kwargs: dict[str, Any] = {"voice": active_voice, "rate": safe_rate, "pitch": safe_pitch}
+        if supports_boundary:
+            kwargs["boundary"] = "WordBoundary"
+        communicator = edge_tts.Communicate(clean_text, **kwargs)
         words: list[TimedWord] = []
+        audio_bytes = 0
         with out_mp3.open("wb") as f:
             async for chunk in communicator.stream():
                 ctype = chunk.get("type")
                 if ctype == "audio":
-                    f.write(chunk["data"])
+                    data = chunk.get("data") or b""
+                    f.write(data)
+                    audio_bytes += len(data)
                 elif ctype == "WordBoundary":
                     w_text = str(chunk.get("text", "")).strip()
                     if not w_text:
@@ -182,16 +321,39 @@ async def _synthesize_beat_tts(
                     offset_s = float(chunk.get("offset", 0)) / 10_000_000.0
                     dur_s = max(0.05, float(chunk.get("duration", 0)) / 10_000_000.0)
                     words.append(TimedWord(word=w_text, start=offset_s, end=offset_s + dur_s))
+        if audio_bytes <= 1024:
+            raise RuntimeError(f"No audio was received from edge-tts ({active_voice}, bytes={audio_bytes}).")
         return words
 
     last_err: Exception | None = None
-    for attempt in range(1, 3):
-        try:
-            return await asyncio.wait_for(_run_tts(), timeout=TTS_TIMEOUT_SEC)
-        except Exception as exc:
-            last_err = exc
-            logger.warning("edge-tts beat attempt %d/2 failed (%s); retrying...", attempt, exc)
-    raise RuntimeError(f"edge-tts failed after 2 attempts: {last_err}") from last_err
+    if not force_fallback:
+        for attempt_idx, delay_sec in enumerate(backoffs, start=1):
+            active_voice = voices[(attempt_idx - 1) % len(voices)]
+            try:
+                return await asyncio.wait_for(_run_edge_once(active_voice), timeout=TTS_TIMEOUT_SEC)
+            except Exception as exc:
+                last_err = exc
+                out_mp3.unlink(missing_ok=True)
+                logger.warning(
+                    "edge-tts attempt %d/%d failed [voice=%s] (%s); backing off %.0fs...",
+                    attempt_idx,
+                    len(backoffs),
+                    active_voice,
+                    exc,
+                    delay_sec,
+                )
+                if attempt_idx < len(backoffs):
+                    await asyncio.sleep(delay_sec)
+
+    logger.error(
+        "All %d edge-tts attempts failed (last error: %s). Activating automatic fallback TTS engine.",
+        len(backoffs),
+        last_err,
+    )
+    ff = ffmpeg_bin or _find_ffmpeg()
+    await asyncio.to_thread(_synthesize_fallback_tts, clean_text, out_mp3, ff)
+    # Return empty word boundaries so _align_words_to_trimmed_duration maps captions smoothly by word weight
+    return []
 
 
 def _trim_silence_ffmpeg(raw_audio: Path, trimmed_wav: Path, ffmpeg_bin: str) -> None:
@@ -275,14 +437,25 @@ async def _build_timed_voiceover(
     cursor = lead_in_sec
 
     for idx, beat in enumerate(beats_raw):
-        spoken = str(beat.get("narration") or beat.get("spoken_text") or "").strip()
+        spoken = _sanitize_tts_text(str(beat.get("narration") or beat.get("spoken_text") or ""))
         if not spoken:
             continue
+
+        # Polite 0.6s delay between beat TTS requests to avoid Microsoft Edge-TTS burst throttling
+        if idx > 0 and TTS_INTER_REQUEST_DELAY_SEC > 0:
+            await asyncio.sleep(TTS_INTER_REQUEST_DELAY_SEC)
 
         raw_mp3 = work_dir / f"scene_{idx:02d}_raw.mp3"
         trimmed_wav = work_dir / f"scene_{idx:02d}_trim.wav"
 
-        raw_words = await _synthesize_beat_tts(spoken, raw_mp3, voice=voice, rate=rate, pitch=pitch)
+        raw_words = await _synthesize_beat_tts(
+            spoken,
+            raw_mp3,
+            voice=voice,
+            rate=rate,
+            pitch=pitch,
+            ffmpeg_bin=ffmpeg_bin,
+        )
         _trim_silence_ffmpeg(raw_mp3, trimmed_wav, ffmpeg_bin)
         dur = get_audio_duration(trimmed_wav, ffmpeg_bin)
 
